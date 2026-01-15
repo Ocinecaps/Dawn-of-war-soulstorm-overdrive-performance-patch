@@ -1,50 +1,51 @@
 #include "ZeroPEChecksum.h"
-#include "DebugLogger.h"
+#include "../MasterLoggerDLL/include/Logger.h"
 #include <fstream>
 #include <windows.h>
 
-// Implementation of ZeroPEChecksum
-bool ZeroPEChecksum(const std::string& exePath) {
-    DebugLogger::Log(DebugLogger::INFO, "ZeroPEChecksum: Opening file %s", exePath.c_str());
+// Implementation of Dawn of War PE Checksum Zeroing
+bool ZeroDawnOfWarPEChecksum(const std::string& executablePath) {
+    Log_Write(DAWN_OF_WAR_LOG_INFO, "ZeroDawnOfWarPEChecksum", "Opening Dawn of War executable file %s", executablePath.c_str());
 
-    std::fstream f(exePath, std::ios::in | std::ios::out | std::ios::binary);
-    if (!f.is_open()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "ZeroPEChecksum: Failed to open file.");
+    std::fstream executableFile(executablePath, std::ios::in | std::ios::out | std::ios::binary);
+    if (!executableFile.is_open()) {
+        Log_Write(DAWN_OF_WAR_LOG_ERROR, "ZeroDawnOfWarPEChecksum", "Failed to open Dawn of War executable file.");
         return false;
     }
 
-    IMAGE_DOS_HEADER dosH = {};
-    f.read(reinterpret_cast<char*>(&dosH), sizeof(dosH));
-    if (dosH.e_magic != IMAGE_DOS_SIGNATURE) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "ZeroPEChecksum: Invalid DOS signature.");
-        f.close();
+    IMAGE_DOS_HEADER dosHeader = {};
+    executableFile.read(reinterpret_cast<char*>(&dosHeader), sizeof(dosHeader));
+    if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+        Log_Write(DAWN_OF_WAR_LOG_ERROR, "ZeroDawnOfWarPEChecksum", "Invalid DOS signature in Dawn of War executable.");
+        executableFile.close();
         return false;
     }
 
-    f.seekg(dosH.e_lfanew, std::ios::beg);
-    IMAGE_NT_HEADERS32 nth = {};
-    f.read(reinterpret_cast<char*>(&nth), sizeof(nth));
+    executableFile.seekg(dosHeader.e_lfanew, std::ios::beg);
+    IMAGE_NT_HEADERS32 ntHeaders = {};
+    executableFile.read(reinterpret_cast<char*>(&ntHeaders), sizeof(ntHeaders));
 
-    if (nth.Signature != IMAGE_NT_SIGNATURE ||
-        nth.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "ZeroPEChecksum: Invalid NT header.");
-        f.close();
+    if (ntHeaders.Signature != IMAGE_NT_SIGNATURE ||
+        ntHeaders.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        Log_Write(DAWN_OF_WAR_LOG_ERROR, "ZeroDawnOfWarPEChecksum", "Invalid NT header in Dawn of War executable.");
+        executableFile.close();
         return false;
     }
 
-    nth.FileHeader.TimeDateStamp = 0;
-    nth.OptionalHeader.CheckSum = 0;
+    // Clear PE checksum and debug information for Dawn of War executable
+    ntHeaders.FileHeader.TimeDateStamp = 0;
+    ntHeaders.OptionalHeader.CheckSum = 0;
 
-    if (nth.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
-        nth.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
-        nth.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
+    if (ntHeaders.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+        ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
+        ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
     }
 
-    f.clear();
-    f.seekp(dosH.e_lfanew, std::ios::beg);
-    f.write(reinterpret_cast<const char*>(&nth), sizeof(nth));
-    f.close();
+    executableFile.clear();
+    executableFile.seekp(dosHeader.e_lfanew, std::ios::beg);
+    executableFile.write(reinterpret_cast<const char*>(&ntHeaders), sizeof(ntHeaders));
+    executableFile.close();
 
-    DebugLogger::Log(DebugLogger::INFO, "ZeroPEChecksum: Succeeded.");
+    Log_Write(DAWN_OF_WAR_LOG_INFO, "ZeroDawnOfWarPEChecksum", "Dawn of War PE checksum zeroing completed successfully.");
     return true;
 }

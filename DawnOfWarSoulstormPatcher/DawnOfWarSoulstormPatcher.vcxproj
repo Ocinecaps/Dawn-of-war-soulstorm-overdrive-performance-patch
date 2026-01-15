@@ -22,9 +22,9 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{4d008a5a-e8d1-4490-83a0-77042b781159}</ProjectGuid>
-    <RootNamespace>DawnOfWarSoulstormPatcher</RootNamespace>
+    <RootNamespace>Redone</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>DawnOfWarSoulstormPatcher</ProjectName>
+    <ProjectName>Overdrive exe patcher</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <!-- Debug | Win32 Configuration -->
@@ -64,22 +64,22 @@
   <PropertyGroup Label="UserMacros" />
   <!-- Output Directories -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <TargetName>DawnOfWarSoulstormPatcher</TargetName>
+    <TargetName>OverdrivePatcher</TargetName>
     <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
-    <TargetName>DawnOfWarSoulstormPatcher</TargetName>
-    <OutDir>..\Output\</OutDir>
+    <TargetName>OverdrivePatcher</TargetName>
+    <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <TargetName>DawnOfWarSoulstormPatcher</TargetName>
+    <TargetName>OverdrivePatcher</TargetName>
     <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <TargetName>DawnOfWarSoulstormPatcher</TargetName>
+    <TargetName>OverdrivePatcher</TargetName>
     <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
@@ -98,7 +98,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>MasterLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <!-- Compile & Link Settings for Release | Win32 -->
@@ -119,7 +119,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>MasterLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <!-- Compile & Link Settings for Debug | x64 -->
@@ -135,7 +135,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>MasterLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <!-- Compile & Link Settings for Release | x64 -->
@@ -155,13 +155,13 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>MasterLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <!-- Source Files -->
   <ItemGroup>
     <ClCompile Include="DllUtils.cpp" />
-    <ClCompile Include="DawnOfWarSoulstormPatcher.cpp" />
+    <ClCompile Include="Overdrive exe.cpp" />
     <ClCompile Include="ZeroPEChecksum.cpp" />
   </ItemGroup>
   <!-- Header Files -->

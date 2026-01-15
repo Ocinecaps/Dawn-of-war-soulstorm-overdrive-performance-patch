@@ -1,10 +1,10 @@
 #pragma once
-#ifndef ZERO_PE_CHECKSUM_H
-#define ZERO_PE_CHECKSUM_H
+#ifndef DAWN_OF_WAR_PE_CHECKSUM_H
+#define DAWN_OF_WAR_PE_CHECKSUM_H
 
 #include <string>
 
-// Function declaration for ZeroPEChecksum
-bool ZeroPEChecksum(const std::string& exePath);
+// Function declaration for Dawn of War PE Checksum Zeroing
+bool ZeroDawnOfWarPEChecksum(const std::string& executablePath);
 
-#endif // ZERO_PE_CHECKSUM_H
+#endif // DAWN_OF_WAR_PE_CHECKSUM_H

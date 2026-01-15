@@ -3,7 +3,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include "DebugLogger.h"
+#include "../MasterLoggerDLL/include/Logger.h"
 
 #define SOULSTORM_CONFIG_PATH "Local.ini"
 #define DEFAULT_WIDTH 1920
@@ -14,7 +14,7 @@ struct Resolution {
     int height;
 };
 
-inline Resolution GetNativeResolution() {
+Resolution GetNativeResolution() {
     DEVMODE dm;
     memset(&dm, 0, sizeof(dm));
     dm.dmSize = sizeof(dm);
@@ -24,10 +24,10 @@ inline Resolution GetNativeResolution() {
     return { DEFAULT_WIDTH, DEFAULT_HEIGHT }; // Fallback to 1080p if unknown
 }
 
-static bool UpdateResolutionConfig(const std::string& filePath, const Resolution& res) {
+bool UpdateResolutionConfig(const std::string& filePath, const Resolution& res) {
     std::ifstream inFile(filePath);
     if (!inFile.is_open()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "Failed to open config file: %s", filePath.c_str());
+        Log_Write(LOG_ERROR, "Resolution", "Failed to open config file: %s", filePath.c_str());
         return false;
     }
 
@@ -49,14 +49,14 @@ static bool UpdateResolutionConfig(const std::string& filePath, const Resolution
     inFile.close();
 
     if (!resolutionFound) {
-        DebugLogger::Log(DebugLogger::WARNING, "Resolution settings not found in config. Adding manually.");
+        Log_Write(LOG_WARN, "Resolution", "Resolution settings not found in config. Adding manually.");
         lines.push_back("screenwidth=" + std::to_string(res.width));
         lines.push_back("screenheight=" + std::to_string(res.height));
     }
 
     std::ofstream outFile(filePath);
     if (!outFile.is_open()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "Failed to write to config file: %s", filePath.c_str());
+        Log_Write(LOG_ERROR, "Resolution", "Failed to write to config file: %s", filePath.c_str());
         return false;
     }
 
@@ -64,14 +64,14 @@ static bool UpdateResolutionConfig(const std::string& filePath, const Resolution
         outFile << l << "\n";
     }
     outFile.close();
-    DebugLogger::Log(DebugLogger::INFO, "Resolution set to %dx%d in config file.", res.width, res.height);
+    Log_Write(LOG_INFO, "Resolution", "Resolution set to %dx%d in config file.", res.width, res.height);
     return true;
 }
 
-static void ApplyUltrawidePatch() {
-    DebugLogger::Log(DebugLogger::INFO, "Applying ultrawide patch...");
+void ApplyUltrawidePatch() {
+    Log_Write(LOG_INFO, "Resolution", "Applying ultrawide patch...");
     Resolution nativeRes = GetNativeResolution();
-    DebugLogger::Log(DebugLogger::INFO, "Detected native resolution: %dx%d", nativeRes.width, nativeRes.height);
+    Log_Write(LOG_INFO, "Resolution", "Detected native resolution: %dx%d", nativeRes.width, nativeRes.height);
 
     if (!UpdateResolutionConfig(SOULSTORM_CONFIG_PATH, nativeRes)) {
         MessageBoxA(nullptr, "Failed to update resolution settings.", "Error", MB_ICONERROR);
@@ -81,11 +81,9 @@ static void ApplyUltrawidePatch() {
     }
 }
 
-#ifndef BUILD_AS_DLL
-int main() {
-    DebugLogger::Init();
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    Log_Initialize();
     ApplyUltrawidePatch();
-    DebugLogger::Cleanup();
+    Log_Shutdown();
     return 0;
 }
-#endif

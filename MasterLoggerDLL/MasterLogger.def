@@ -1,0 +1,14 @@
+EXPORTS
+DawnOfWarLog_Initialize
+DawnOfWarLog_Shutdown
+DawnOfWarLog_SetLevel
+DawnOfWarLog_SetModuleLevel
+DawnOfWarLog_Write
+DawnOfWarLog_WriteVA
+DawnOfWarLog_HexDump
+DawnOfWarLog_Flush
+DawnOfWarLog_ReloadConfig
+DawnOfWarLog_IsLevelEnabled
+DawnOfWarLog_GetStats
+DawnOfWarLog_SetCrashHandler
+DawnOfWarLog_WriteStackTrace

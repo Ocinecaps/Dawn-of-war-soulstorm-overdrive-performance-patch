@@ -24,7 +24,6 @@
     <ProjectGuid>{ade1a11a-02dd-4f79-8971-0f60fb1371a7}</ProjectGuid>
     <RootNamespace>DawnOfWarMemoryPoolDLL</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>DawnOfWarMemoryPoolDLL</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">

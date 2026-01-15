@@ -33,7 +33,7 @@
 #pragma comment(linker, "/SECTION:.injsec,RWE")
 #endif
 
-#include "DebugLogger.h"
+#include "../MasterLoggerDLL/include/Logger.h"
 #include "DllUtils.h"
 
 #define PATCH_SIZE 2
@@ -53,17 +53,17 @@ void PatchMultiplayerLobby(HANDLE hProcess, LPVOID patchAddr) {
     DWORD oldProtect;
     MEMORY_BASIC_INFORMATION mbi;
     if (VirtualQueryEx(hProcess, patchAddr, &mbi, sizeof(mbi))) {
-        DebugLogger::Log(DebugLogger::INFO, "Current Memory Protection: %lu", mbi.Protect);
+        Log_Write(LOG_INFO, "PatchMultiplayerLobby", "Current Memory Protection: %lu", mbi.Protect);
     }
     else {
-        DebugLogger::Log(DebugLogger::CRITICAL, "Failed to query memory protection.");
+        Log_Write(LOG_ERROR, "PatchMultiplayerLobby", "Failed to query memory protection.");
         return;
     }
     if (VirtualProtectEx(hProcess, patchAddr, PATCH_SIZE, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         SIZE_T bytesWritten;
         if (WriteProcessMemory(hProcess, patchAddr, PATCH_BYTES, PATCH_SIZE, &bytesWritten)) {
             if (!VirtualProtectEx(hProcess, patchAddr, PATCH_SIZE, oldProtect, &oldProtect)) {
-                DebugLogger::Log(DebugLogger::WARNING, "Failed to restore original memory protection.");
+                Log_Write(LOG_WARN, "PatchMultiplayerLobby", "Failed to restore original memory protection.");
             }
             else {
                 MessageBoxA(nullptr, "[+] Successfully patched multiplayer lobby!", "Success", MB_OK);
@@ -72,12 +72,12 @@ void PatchMultiplayerLobby(HANDLE hProcess, LPVOID patchAddr) {
         }
         else {
             DWORD dwError = GetLastError();
-            DebugLogger::Log(DebugLogger::CRITICAL, "Failed to write memory: %lu", dwError);
+            Log_Write(LOG_ERROR, "PatchMultiplayerLobby", "Failed to write memory: %lu", dwError);
         }
     }
     else {
         DWORD dwError = GetLastError();
-        DebugLogger::Log(DebugLogger::CRITICAL, "Failed to change memory protection: %lu", dwError);
+        Log_Write(LOG_ERROR, "PatchMultiplayerLobby", "Failed to change memory protection: %lu", dwError);
     }
 }
 
@@ -171,16 +171,16 @@ static std::string PickSoulstormExe() {
 }
 
 bool EnableLAA(const std::string& exePath) {
-    DebugLogger::Log(DebugLogger::INFO, "EnableLAA: Opening file %s", exePath.c_str());
+    Log_Write(LOG_INFO, "EnableLAA", "Opening file %s", exePath.c_str());
     std::fstream f(exePath.c_str(), std::ios::in | std::ios::out | std::ios::binary);
     if (!f.is_open()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "EnableLAA: Failed to open file.");
+        Log_Write(LOG_ERROR, "EnableLAA", "Failed to open file.");
         return false;
     }
     IMAGE_DOS_HEADER dosH = {};
     f.read(reinterpret_cast<char*>(&dosH), sizeof(dosH));
     if (dosH.e_magic != IMAGE_DOS_SIGNATURE) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "EnableLAA: Invalid DOS signature.");
+        Log_Write(LOG_ERROR, "EnableLAA", "Invalid DOS signature.");
         f.close();
         return false;
     }
@@ -188,7 +188,7 @@ bool EnableLAA(const std::string& exePath) {
     IMAGE_NT_HEADERS32 nth = {};
     f.read(reinterpret_cast<char*>(&nth), sizeof(nth));
     if (nth.Signature != IMAGE_NT_SIGNATURE || nth.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "EnableLAA: Invalid NT header.");
+        Log_Write(LOG_ERROR, "EnableLAA", "Invalid NT header.");
         f.close();
         return false;
     }
@@ -197,7 +197,7 @@ bool EnableLAA(const std::string& exePath) {
     f.seekp(dosH.e_lfanew, std::ios::beg);
     f.write(reinterpret_cast<const char*>(&nth), sizeof(nth));
     f.close();
-    DebugLogger::Log(DebugLogger::INFO, "EnableLAA: Succeeded.");
+    Log_Write(LOG_INFO, "EnableLAA", "Succeeded.");
     return true;
 }
 
@@ -206,16 +206,16 @@ DWORD AlignValue(DWORD value, DWORD alignment) {
 }
 
 bool InjectInjsec(const std::string& exePath) {
-    DebugLogger::Log(DebugLogger::INFO, "InjectInjsec: Opening file %s", exePath.c_str());
+    Log_Write(LOG_INFO, "InjectInjsec", "Opening file %s", exePath.c_str());
     std::fstream f(exePath, std::ios::in | std::ios::out | std::ios::binary);
     if (!f.is_open()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "InjectInjsec: Failed to open file.");
+        Log_Write(LOG_ERROR, "InjectInjsec", "Failed to open file.");
         return false;
     }
     IMAGE_DOS_HEADER dosH = {};
     f.read(reinterpret_cast<char*>(&dosH), sizeof(dosH));
     if (dosH.e_magic != IMAGE_DOS_SIGNATURE) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "InjectInjsec: Invalid DOS signature.");
+        Log_Write(LOG_ERROR, "InjectInjsec", "Invalid DOS signature.");
         f.close();
         return false;
     }
@@ -223,12 +223,12 @@ bool InjectInjsec(const std::string& exePath) {
     IMAGE_NT_HEADERS32 nth = {};
     f.read(reinterpret_cast<char*>(&nth), sizeof(nth));
     if (nth.Signature != IMAGE_NT_SIGNATURE || nth.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "InjectInjsec: Invalid NT header.");
+        Log_Write(LOG_ERROR, "InjectInjsec", "Invalid NT header.");
         f.close();
         return false;
     }
     WORD secCount = nth.FileHeader.NumberOfSections;
-    DebugLogger::Log(DebugLogger::INFO, "InjectInjsec: Section count: %d", secCount);
+    Log_Write(LOG_INFO, "InjectInjsec", "Section count: %d", secCount);
     std::vector<IMAGE_SECTION_HEADER> secs(secCount);
     f.read(reinterpret_cast<char*>(secs.data()), secCount * sizeof(IMAGE_SECTION_HEADER));
     DWORD fAlign = nth.OptionalHeader.FileAlignment;
@@ -254,17 +254,17 @@ bool InjectInjsec(const std::string& exePath) {
     std::vector<char> blank(inj.SizeOfRawData, 0);
     f.write(blank.data(), blank.size());
     f.close();
-    DebugLogger::Log(DebugLogger::INFO, "InjectInjsec: Succeeded.");
+    Log_Write(LOG_INFO, "InjectInjsec", "Succeeded.");
     return true;
 }
 
 // Line ~454: RunPatch starts
 void RunPatch() {
-    DebugLogger::Log(DebugLogger::INFO, "RunPatch: Executing in-game modifications...");
+    Log_Write(LOG_INFO, "RunPatch", "Executing in-game modifications...");
     HANDLE hProcess = GetCurrentProcess();
     DWORD_PTR patchAddr = FindPatchAddress(PATCH_SIGNATURE, PATCH_SIZE);
     if (!patchAddr) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "RunPatch: Could not find patch address!");
+        Log_Write(LOG_ERROR, "RunPatch", "Could not find patch address!");
         MessageBoxA(nullptr, "[-] Could not find patch address!", "Error", MB_ICONERROR);
         return;
     }
@@ -272,21 +272,21 @@ void RunPatch() {
 }
 
 bool PatchSoulstorm(const std::string& path) {
-    DebugLogger::Log(DebugLogger::INFO, "PatchSoulstorm: Starting patch for %s", path.c_str());
+    Log_Write(LOG_INFO, "PatchSoulstorm", "Starting patch for %s", path.c_str());
     if (!EnableLAA(path)) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "PatchSoulstorm: EnableLAA failed.");
+        Log_Write(LOG_ERROR, "PatchSoulstorm", "EnableLAA failed.");
         return false;
     }
-    DebugLogger::Log(DebugLogger::INFO, "[OK] EnableLAA applied successfully.");
+    Log_Write(LOG_INFO, "PatchSoulstorm", "[OK] EnableLAA applied successfully.");
     if (!InjectInjsec(path)) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "PatchSoulstorm: InjectInjsec failed.");
+        Log_Write(LOG_ERROR, "PatchSoulstorm", "InjectInjsec failed.");
         return false;
     }
-    DebugLogger::Log(DebugLogger::INFO, "[OK] InjectInjsec applied successfully.");
-    DebugLogger::Log(DebugLogger::INFO, "[->] Executing RunPatch() for runtime modifications...");
+    Log_Write(LOG_INFO, "PatchSoulstorm", "[OK] InjectInjsec applied successfully.");
+    Log_Write(LOG_INFO, "PatchSoulstorm", "[->] Executing RunPatch() for runtime modifications...");
     RunPatch();
-    DebugLogger::Log(DebugLogger::INFO, "[OK] RunPatch() executed successfully.");
-    DebugLogger::Log(DebugLogger::INFO, "PatchSoulstorm: All patch steps completed.");
+    Log_Write(LOG_INFO, "PatchSoulstorm", "[OK] RunPatch() executed successfully.");
+    Log_Write(LOG_INFO, "PatchSoulstorm", "All patch steps completed.");
     return true;
 }
 
@@ -318,47 +318,47 @@ std::wstring GetSoulstormPath() {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    DebugLogger::Init();
-    DebugLogger::Log(DebugLogger::INFO, "WinMain started.");
+    Log_Initialize(nullptr);
+    Log_Write(LOG_INFO, "WinMain", "WinMain started.");
     if (!IsRunningAsAdmin()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "Not running as admin. Relaunching...");
+        Log_Write(LOG_ERROR, "WinMain", "Not running as admin. Relaunching...");
         RelaunchAsAdmin();
         return 0;
     }
     std::string soulExe = PickSoulstormExe();
     if (soulExe.empty()) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "No EXE selected by user.");
+        Log_Write(LOG_ERROR, "WinMain", "No EXE selected by user.");
         MessageBoxA(nullptr, "No EXE selected.", "Error", MB_ICONERROR);
         return 1;
     }
-    DebugLogger::Log(DebugLogger::INFO, "User selected EXE: %s", soulExe.c_str());
+    Log_Write(LOG_INFO, "WinMain", "User selected EXE: %s", soulExe.c_str());
     try {
-        DebugLogger::Log(DebugLogger::INFO, "Getting Soulstorm path from registry...");
+        Log_Write(LOG_INFO, "WinMain", "Getting Soulstorm path from registry...");
         std::wstring soulstormPath;
         try {
             soulstormPath = GetSoulstormPath();
-            DebugLogger::Log(DebugLogger::INFO, "Found Soulstorm installation path in registry");
+            Log_Write(LOG_INFO, "WinMain", "Found Soulstorm installation path in registry");
         }
         catch (const std::exception& e) {
-            DebugLogger::Log(DebugLogger::CRITICAL, "Failed to get Soulstorm path: %s", e.what());
+            Log_Write(LOG_ERROR, "WinMain", "Failed to get Soulstorm path: %s", e.what());
             MessageBoxA(nullptr, "Failed to locate Soulstorm installation in registry.", "Error", MB_ICONERROR);
             return 1;
         }
         const std::wstring memoryPoolDllPath = soulstormPath + L"MemoryPoolDLL.dll";
         if (GetFileAttributesW(memoryPoolDllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            DebugLogger::Log(DebugLogger::CRITICAL, "MemoryPoolDLL.dll not found in Soulstorm directory");
+            Log_Write(LOG_ERROR, "WinMain", "MemoryPoolDLL.dll not found in Soulstorm directory");
             MessageBoxA(nullptr, "MemoryPoolDLL.dll not found in Soulstorm directory.", "Error", MB_ICONERROR);
             return 1;
         }
-        DebugLogger::Log(DebugLogger::INFO, "Loading MemoryPool DLL...");
+        Log_Write(LOG_INFO, "WinMain", "Loading MemoryPool DLL...");
         DllHandle memoryPoolDll = loadDll(memoryPoolDllPath);
         if (!memoryPoolDll.get()) {
-            DebugLogger::Log(DebugLogger::CRITICAL, "Failed to load MemoryPool DLL");
+            Log_Write(LOG_ERROR, "WinMain", "Failed to load MemoryPool DLL");
             MessageBoxA(nullptr, "Failed to load MemoryPool DLL.", "Error", MB_ICONERROR);
             return 1;
         }
         if (!PatchSoulstorm(soulExe)) {
-            DebugLogger::Log(DebugLogger::CRITICAL, "PatchSoulstorm failed.");
+            Log_Write(LOG_ERROR, "WinMain", "PatchSoulstorm failed.");
             MessageBoxA(nullptr, "Patch failed – multiplayer net-lobby might remain hidden.", "Patch Error", MB_ICONERROR);
             return 1;
         }
@@ -370,18 +370,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             " - MemoryPool DLL injected\n\n"
             "Success!",
             "Done", MB_OK);
-        DebugLogger::Log(DebugLogger::INFO, "All done.");
+        Log_Write(LOG_INFO, "WinMain", "All done.");
     }
     catch (const std::exception& e) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "Exception caught: %s", e.what());
+        Log_Write(LOG_ERROR, "WinMain", "Exception caught: %s", e.what());
         MessageBoxA(nullptr, e.what(), "Error", MB_ICONERROR);
         return 1;
     }
     catch (...) {
-        DebugLogger::Log(DebugLogger::CRITICAL, "Unknown exception caught.");
+        Log_Write(LOG_ERROR, "WinMain", "Unknown exception caught.");
         MessageBoxA(nullptr, "Unknown error occurred.", "Error", MB_ICONERROR);
         return 1;
     }
-    DebugLogger::Cleanup();
+    Log_Shutdown();
     return 0;
 }
