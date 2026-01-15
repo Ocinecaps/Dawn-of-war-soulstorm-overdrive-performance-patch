@@ -7,7 +7,22 @@
 #ifndef PCH_H
 #define PCH_H
 
-// add headers that you want to pre-compile here
-#include "framework.h"
+#define _WIN32_WINNT 0x0600
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+// Windows headers
+#include <windows.h>
+#include <memoryapi.h>
+
+// C++ standard library headers
+#include <cstdint>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <vector>
 
 #endif //PCH_H
