@@ -5,6 +5,13 @@
 #include <windows.h>
 #include <stdarg.h>
 
+// DLL export/import macro
+#ifdef DAWN_OF_WAR_LOGGER_EXPORTS
+#define DAWN_OF_WAR_LOGGER_API __declspec(dllexport)
+#else
+#define DAWN_OF_WAR_LOGGER_API __declspec(dllimport)
+#endif
+
 // Dawn of War Logger Log Levels
 typedef enum {
     DAWN_OF_WAR_LOG_TRACE = 0,
@@ -58,6 +65,36 @@ typedef struct {
     int networkPort;
 } DawnOfWarLogConfig;
 
+// Performance statistics structure
+typedef struct {
+    DWORD messagesLogged;
+    DWORD bytesWritten;
+    DWORD logRotations;
+    DWORD exceptionsCaught;
+    DWORD highestQueueDepth;
+    LARGE_INTEGER startupTime;
+    DWORD totalSessions;
+    DWORD averageMessagesPerSecond;
+    DWORD peakMessagesPerSecond;
+    DWORD totalErrors;
+    DWORD totalWarnings;
+    size_t peakMemoryUsage;
+} DawnOfWarLoggerStats;
+
+// Memory tracking integration
+typedef struct {
+    size_t currentAllocations;
+    size_t peakAllocations;
+    size_t totalAllocated;
+    size_t totalFreed;
+    DWORD memoryChecksPerformed;
+    DWORD allocationFailures;
+    size_t largestAllocation;
+    size_t smallestAllocation;
+    DWORD fragmentationEvents;
+    CRITICAL_SECTION memoryCs;
+} DawnOfWarMemoryStats;
+
 typedef struct {
     DawnOfWarLogConfig config;
     HANDLE logFile;
@@ -75,6 +112,11 @@ typedef struct {
     DWORD totalMessages;
     DWORD messagesPerSecond;
     CRITICAL_SECTION statsCs;
+    DawnOfWarLoggerStats stats;
+    DawnOfWarMemoryStats memoryStats;
+    BOOL enhancedConsoleEnabled;
+    DWORD consoleUpdateInterval;
+    LARGE_INTEGER lastConsoleUpdate;
 } DawnOfWarLoggerState;
 
 typedef struct DawnOfWarModuleLevel {
@@ -93,29 +135,56 @@ extern "C" {
 #endif
 
 // Dawn of War Logger Core Functions
-__declspec(dllexport) void DawnOfWarLog_Initialize(const char* configPath);
-__declspec(dllexport) void DawnOfWarLog_Shutdown(void);
-__declspec(dllexport) void DawnOfWarLog_SetLevel(DawnOfWarLogLevel level);
-__declspec(dllexport) void DawnOfWarLog_SetModuleLevel(const char* module, DawnOfWarLogLevel level);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_Initialize(const char* configPath);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_Shutdown(void);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_SetLevel(DawnOfWarLogLevel level);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_SetModuleLevel(const char* module, DawnOfWarLogLevel level);
 
 // Dawn of War Logger Main Logging Function
-__declspec(dllexport) void DawnOfWarLog_Write(DawnOfWarLogLevel level, const char* module, const char* format, ...);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_Write(DawnOfWarLogLevel level, const char* module, const char* format, ...);
 
 // Dawn of War Logger Specialized Functions
-__declspec(dllexport) void DawnOfWarLog_HexDump(DawnOfWarLogLevel level, const char* module, const void* data, size_t size);
-__declspec(dllexport) void DawnOfWarLog_WriteVA(DawnOfWarLogLevel level, const char* module, const char* format, va_list args);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_HexDump(DawnOfWarLogLevel level, const char* module, const unsigned char* data, size_t size);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_WriteVA(DawnOfWarLogLevel level, const char* module, const char* format, va_list args);
 
 // Dawn of War Logger Configuration and Control
-__declspec(dllexport) void DawnOfWarLog_Flush(void);
-__declspec(dllexport) void DawnOfWarLog_ReloadConfig(void);
-__declspec(dllexport) BOOL DawnOfWarLog_IsLevelEnabled(DawnOfWarLogLevel level, const char* module);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_Flush(void);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_ReloadConfig(void);
+DAWN_OF_WAR_LOGGER_API BOOL DawnOfWarLog_IsLevelEnabled(DawnOfWarLogLevel level, const char* module);
 
 // Dawn of War Logger Performance and Statistics
-__declspec(dllexport) void DawnOfWarLog_GetStats(DWORD* messagesPerSec, DWORD* queueDepth, DWORD* memoryUsage);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_GetStats(DWORD* messagesPerSec, DWORD* queueDepth, DWORD* memoryUsage);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_GetDetailedStats(DawnOfWarLoggerStats* stats);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_GetMemoryStats(DawnOfWarMemoryStats* stats);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_ResetStats(void);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_EnableEnhancedConsole(BOOL enable);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_UpdateConsoleDisplay(void);
+
+// Dawn of War Logger Memory Tracking Integration
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_TrackAllocation(size_t size, void* ptr);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_TrackDeallocation(size_t size, void* ptr);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_TrackAllocationFailure(size_t size);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_TrackFragmentation(size_t wastedBytes);
 
 // Dawn of War Logger Crash Handling
-__declspec(dllexport) void DawnOfWarLog_SetCrashHandler(void);
-__declspec(dllexport) void DawnOfWarLog_WriteStackTrace(DawnOfWarLogLevel level, const char* module);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_SetCrashHandler(void);
+DAWN_OF_WAR_LOGGER_API void DawnOfWarLog_WriteStackTrace(DawnOfWarLogLevel level, const char* module);
+
+// LAA State Tracking Functions
+DAWN_OF_WAR_LOGGER_API void LogLAAStateFromPatcher(const char* executablePath, bool laaEnabled, 
+                                                  bool is64BitOS, size_t totalMemory, size_t availableMemory,
+                                                  size_t addressSpace, DWORD_PTR imageBase);
+
+DAWN_OF_WAR_LOGGER_API void LogLAAStateFromMemoryDLL(const char* executablePath, bool laaEnabled,
+                                                      bool is64BitOS, bool highMemoryAvailable, 
+                                                      size_t totalMemory, size_t availableMemory,
+                                                      size_t currentProcessMemory, size_t addressSpace,
+                                                      DWORD_PTR imageBase, bool canUseLargeAddresses);
+
+DAWN_OF_WAR_LOGGER_API void LogLAATransition(const char* source, const char* executablePath, 
+                                             bool fromState, bool toState, const char* reason);
+
+DAWN_OF_WAR_LOGGER_API void GetLAAStateSummary(char* buffer, size_t bufferSize);
 
 #ifdef __cplusplus
 }
@@ -188,7 +257,7 @@ public:
         va_end(args);
     }
     
-    static void HexDump(DawnOfWarLogLevel level, const char* module, const void* data, size_t size) {
+    static void HexDump(DawnOfWarLogLevel level, const char* module, const unsigned char* data, size_t size) {
         DawnOfWarLog_HexDump(level, module, data, size);
     }
     

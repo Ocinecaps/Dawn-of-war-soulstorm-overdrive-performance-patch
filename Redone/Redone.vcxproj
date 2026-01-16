@@ -65,22 +65,22 @@
   <!-- Output Directories -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <TargetName>DawnOfWarSoulstormPatcher</TargetName>
-    <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
+    <OutDir>$(SolutionDir)Output\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <TargetName>DawnOfWarSoulstormPatcher</TargetName>
-    <OutDir>..\Output\</OutDir>
+    <OutDir>$(SolutionDir)Output\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <TargetName>DawnOfWarSoulstormPatcher</TargetName>
-    <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
+    <OutDir>$(SolutionDir)Output\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TargetName>DawnOfWarSoulstormPatcher</TargetName>
-    <OutDir>$(SolutionDir)Output\$(Platform)\$(Configuration)\</OutDir>
+    <OutDir>$(SolutionDir)Output\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <!-- Compile & Link Settings for Debug | Win32 -->
@@ -97,7 +97,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -118,7 +118,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -134,7 +134,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -154,7 +154,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(SolutionDir)Output;$(SolutionDir)bin\$(Platform)\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>DawnOfWarLogger.lib;User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>

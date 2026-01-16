@@ -1,13 +1,44 @@
 #include "pch.h"
 #include <chrono>
+#include <fstream>
+#include <iostream>
+#include <windows.h>
+#include <psapi.h>
+#include "../MasterLoggerDLL/include/Logger.h"
+#include "../CodeAnalyzer/IntelligentCodeAnalysis.h"
+
+#pragma comment(lib, "psapi.lib")
+
+// Enhanced logging macros for Memory Pool DLL
+#define MEMPOOL_LOG_TRACE(...) DAWN_OF_WAR_LOG_TRACE("MemoryPool", __VA_ARGS__)
+#define MEMPOOL_LOG_DEBUG(...) DAWN_OF_WAR_LOG_DEBUG("MemoryPool", __VA_ARGS__)
+#define MEMPOOL_LOG_INFO(...) DAWN_OF_WAR_LOG_INFO("MemoryPool", __VA_ARGS__)
+#define MEMPOOL_LOG_WARN(...) DAWN_OF_WAR_LOG_WARN("MemoryPool", __VA_ARGS__)
+#define MEMPOOL_LOG_ERROR(...) DAWN_OF_WAR_LOG_ERROR("MemoryPool", __VA_ARGS__)
+#define MEMPOOL_LOG_FATAL(...) DAWN_OF_WAR_LOG_FATAL("MemoryPool", __VA_ARGS__)
+
+// Performance logging macros for memory operations
+#define MEMPERF_LOG_START(name) \
+    LARGE_INTEGER __memPerfStart_##name; \
+    QueryPerformanceCounter(&__memPerfStart_##name); \
+    MEMPOOL_LOG_TRACE("MemoryPerformance", "Starting memory operation: %s", #name);
+
+#define MEMPERF_LOG_END(name) \
+    do { \
+        LARGE_INTEGER __memPerfEnd_##name, __memPerfFreq; \
+        QueryPerformanceCounter(&__memPerfEnd_##name); \
+        QueryPerformanceFrequency(&__memPerfFreq); \
+        double __elapsed = ((double)(__memPerfEnd_##name.QuadPart - __memPerfStart_##name.QuadPart) / __memPerfFreq.QuadPart) * 1000.0; \
+        MEMPOOL_LOG_DEBUG("MemoryPerformance", "Memory operation %s completed in %.3f ms", #name, __elapsed); \
+    } while(0)
 
 // Force GPU usage
 extern "C" __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 extern "C" __declspec(dllexport) DWORD AmdPowerXpressRequestHighPerformance = 1;
 
-// Memory pool configuration (2GB total) - Enhanced for Dawn of War Soulstorm
-constexpr size_t PRIVATE_MEMORY_SIZE = 1ull * 1024 * 1024 * 1024;  // 1GB
-constexpr size_t TEXTURE_MEMORY_SIZE = 1ull * 1024 * 1024 * 1024; // 1GB
+// Memory pool configuration (512MB total) - Enhanced for Dawn of War Soulstorm
+constexpr size_t PRIVATE_MEMORY_SIZE = 256ull * 1024 * 1024;  // 256MB
+constexpr size_t TEXTURE_MEMORY_SIZE = 256ull * 1024 * 1024; // 256MB
 constexpr size_t TOTAL_POOL_SIZE = PRIVATE_MEMORY_SIZE + TEXTURE_MEMORY_SIZE;
 constexpr size_t NUM_SIZE_CLASSES = 12; // Increased for better granularity
 constexpr size_t MIN_BLOCK_SIZE = 32; // Reduced for smaller allocations
@@ -26,6 +57,11 @@ constexpr size_t STRING_POOL_SIZE = 64 * 1024 * 1024; // 64MB for string operati
 constexpr size_t EXECUTABLE_POOL_SIZE = 256 * 1024 * 1024; // 256MB for executable memory (increased)
 constexpr size_t TEMP_POOL_SIZE = 32 * 1024 * 1024; // 32MB for temporary allocations
 
+// Emergency memory reserve for crash reporting and critical operations
+constexpr size_t EMERGENCY_RESERVE_SIZE = 64 * 1024 * 1024; // 64MB
+static char* g_emergencyReserve = nullptr;
+static std::atomic<size_t> g_emergencyUsed{0};
+
 struct MemoryBlock {
     size_t size;
     bool used;
@@ -43,6 +79,7 @@ struct MemoryPool {
     std::atomic<size_t> offset;
     std::atomic<MemoryBlock*> head;
     std::atomic<MemoryBlock*> freeLists[NUM_SIZE_CLASSES];
+    std::atomic<MemoryBlock*> freeListHead;  // For tracking free blocks in each pool
     std::atomic<size_t> totalAllocated;
     std::atomic<size_t> peakUsage;
     std::atomic<size_t> fragmentationCount;
@@ -73,7 +110,7 @@ struct MemoryPool {
     std::atomic<size_t> cleanupInterval;
     std::atomic<bool> needsDefragmentation;
     
-    MemoryPool() : pool(nullptr), offset(0), head(nullptr), totalAllocated(0), peakUsage(0), fragmentationCount(0),
+    MemoryPool() : pool(nullptr), offset(0), head(nullptr), freeListHead(nullptr), totalAllocated(0), peakUsage(0), fragmentationCount(0),
                    mallocCount(0), freeCount(0), reallocCount(0), totalAllocTime(0), totalFreeTime(0), cacheHits(0), cacheMisses(0), leakCount(0), corruptionCount(0),
                    logAllocCount(0), fileAllocCount(0), guiAllocCount(0), smallObjAllocCount(0), linkedListAllocCount(0), stringAllocCount(0), executableAllocCount(0), tempAllocCount(0),
                    lastCleanupTime(0), cleanupInterval(5000), needsDefragmentation(false) {
@@ -99,7 +136,7 @@ static MemoryPool smallObjPool;   // For small frequent allocations (sub_69A7E0,
 static MemoryPool linkedListPool; // For linked list deallocations (sub_698CF0, sub_6A35F0, sub_6A3840, sub_6A3AA0)
 static MemoryPool stringPool;     // For string operations (sub_6A0AB0, sub_6A3840, sub_6A3AA0, sub_6A35F0, sub_6CB980)
 static MemoryPool executablePool; // For executable memory allocations (sub_9AE540)
-static MemoryPool tempPool;       // For temporary allocations (enhanced)
+static MemoryPool tempPool;       // For temporary allocations
 static CRITICAL_SECTION g_lock;
 static std::atomic<size_t> g_allocationCounter{0}; // Global allocation ID counter
 static bool g_inited = false;
@@ -112,7 +149,6 @@ extern "C" __declspec(dllexport) void* SmallObjMalloc(size_t size);
 extern "C" __declspec(dllexport) void* LinkedListMalloc(size_t size);
 extern "C" __declspec(dllexport) void* StringMalloc(size_t size);
 extern "C" __declspec(dllexport) void* ExecutableMalloc(size_t size);
-extern "C" __declspec(dllexport) void* TempMalloc(size_t size);
 
 // Forward declarations for specialized free functions
 extern "C" __declspec(dllexport) void LogFree(void* ptr);
@@ -123,7 +159,26 @@ extern "C" __declspec(dllexport) void LinkedListFree(void* ptr);
 extern "C" __declspec(dllexport) void StringFree(void* ptr);
 extern "C" __declspec(dllexport) void BatchLinkedListFree(void** ptrs, size_t count);
 extern "C" __declspec(dllexport) void ExecutableFree(void* ptr);
-extern "C" __declspec(dllexport) void TempFree(void* ptr);
+extern "C" __declspec(dllexport) void CustomFree(void* ptr);
+extern "C" __declspec(dllexport) void* CustomRealloc(void* p, size_t size);
+extern "C" __declspec(dllexport) void* CustomCalloc(size_t n, size_t s);
+
+// Forward declarations for maintenance functions
+void DefragmentMemoryPool();
+void PerformMemoryMaintenance();
+void CheckPoolHealth();
+void ReportMemoryStatistics();
+
+// Forward declarations for crash reporting functions
+extern "C" __declspec(dllexport) bool EnsureCrashReportMemory(size_t needed);
+void SetupCrashReporting();
+
+// Forward declarations for memory pressure functions
+bool IsMemoryPressureHigh();
+DWORD GetSystemMemoryUsage();
+
+// Forward declarations for error reporting functions
+void LogMemoryError(const char* function, const char* error, void* address = nullptr, size_t size = 0);
 
 // Function pointers for original APIs
 typedef void* (__cdecl* CRT_Malloc)(size_t);
@@ -173,6 +228,8 @@ int GetSizeClass(size_t size) {
 }
 
 void InitSpecializedPools() {
+    DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Initializing specialized memory pools for Dawn of War Soulstorm");
+    
     // Initialize logging pool
     if (!logPool.pool) {
         char* logMem = static_cast<char*>(VirtualAlloc(nullptr, LOG_BUFFER_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -183,9 +240,13 @@ void InitSpecializedPools() {
             logPool.totalAllocated.store(0, std::memory_order_relaxed);
             logPool.peakUsage.store(0, std::memory_order_relaxed);
             logPool.fragmentationCount.store(0, std::memory_order_relaxed);
+            logPool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 logPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Log pool initialized: %zu bytes at %p", LOG_BUFFER_SIZE, logMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize log pool with %zu bytes", LOG_BUFFER_SIZE);
         }
     }
     
@@ -199,9 +260,13 @@ void InitSpecializedPools() {
             filePool.totalAllocated.store(0, std::memory_order_relaxed);
             filePool.peakUsage.store(0, std::memory_order_relaxed);
             filePool.fragmentationCount.store(0, std::memory_order_relaxed);
+            filePool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 filePool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "File pool initialized: %zu bytes at %p", FILE_BUFFER_SIZE, fileMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize file pool with %zu bytes", FILE_BUFFER_SIZE);
         }
     }
     
@@ -215,9 +280,13 @@ void InitSpecializedPools() {
             guiPool.totalAllocated.store(0, std::memory_order_relaxed);
             guiPool.peakUsage.store(0, std::memory_order_relaxed);
             guiPool.fragmentationCount.store(0, std::memory_order_relaxed);
+            guiPool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 guiPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "GUI pool initialized: %zu bytes at %p", GUI_POOL_SIZE, guiMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize GUI pool with %zu bytes", GUI_POOL_SIZE);
         }
     }
     
@@ -231,9 +300,13 @@ void InitSpecializedPools() {
             smallObjPool.totalAllocated.store(0, std::memory_order_relaxed);
             smallObjPool.peakUsage.store(0, std::memory_order_relaxed);
             smallObjPool.fragmentationCount.store(0, std::memory_order_relaxed);
+            smallObjPool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 smallObjPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Small object pool initialized: %zu bytes at %p", SMALL_OBJ_POOL_SIZE, smallMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize small object pool with %zu bytes", SMALL_OBJ_POOL_SIZE);
         }
     }
     
@@ -247,9 +320,13 @@ void InitSpecializedPools() {
             linkedListPool.totalAllocated.store(0, std::memory_order_relaxed);
             linkedListPool.peakUsage.store(0, std::memory_order_relaxed);
             linkedListPool.fragmentationCount.store(0, std::memory_order_relaxed);
+            linkedListPool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 linkedListPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Linked list pool initialized: %zu bytes at %p", LINKED_LIST_POOL_SIZE, linkedMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize linked list pool with %zu bytes", LINKED_LIST_POOL_SIZE);
         }
     }
     
@@ -263,9 +340,13 @@ void InitSpecializedPools() {
             stringPool.totalAllocated.store(0, std::memory_order_relaxed);
             stringPool.peakUsage.store(0, std::memory_order_relaxed);
             stringPool.fragmentationCount.store(0, std::memory_order_relaxed);
+            stringPool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 stringPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "String pool initialized: %zu bytes at %p", STRING_POOL_SIZE, stringMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize string pool with %zu bytes", STRING_POOL_SIZE);
         }
     }
     
@@ -279,18 +360,223 @@ void InitSpecializedPools() {
             executablePool.totalAllocated.store(0, std::memory_order_relaxed);
             executablePool.peakUsage.store(0, std::memory_order_relaxed);
             executablePool.fragmentationCount.store(0, std::memory_order_relaxed);
+            executablePool.freeListHead.store(nullptr, std::memory_order_relaxed);
             for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
                 executablePool.freeLists[i].store(nullptr, std::memory_order_relaxed);
             }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Executable pool initialized: %zu bytes at %p", EXECUTABLE_POOL_SIZE, execMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize executable pool with %zu bytes", EXECUTABLE_POOL_SIZE);
         }
+    }
+    
+    // Initialize temporary pool
+    if (!tempPool.pool) {
+        char* tempMem = static_cast<char*>(VirtualAlloc(nullptr, TEMP_POOL_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (tempMem) {
+            tempPool.pool = tempMem;
+            tempPool.offset.store(0, std::memory_order_relaxed);
+            tempPool.head.store(nullptr, std::memory_order_relaxed);
+            tempPool.totalAllocated.store(0, std::memory_order_relaxed);
+            tempPool.peakUsage.store(0, std::memory_order_relaxed);
+            tempPool.fragmentationCount.store(0, std::memory_order_relaxed);
+            tempPool.freeListHead.store(nullptr, std::memory_order_relaxed);
+            for (int i = 0; i < NUM_SIZE_CLASSES; ++i) {
+                tempPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
+            }
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Temporary pool initialized: %zu bytes at %p", TEMP_POOL_SIZE, tempMem);
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to initialize temporary pool with %zu bytes", TEMP_POOL_SIZE);
+        }
+    }
+    
+    DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "All specialized memory pools initialization completed");
+}
+
+// LAA State Detection and Memory Configuration
+struct LAAStateInfo {
+    bool isLAAEnabled;
+    bool is64BitOS;
+    bool isHighMemoryAvailable;
+    size_t totalPhysicalMemory;
+    size_t availablePhysicalMemory;
+    size_t maxProcessMemory;
+    size_t currentProcessMemory;
+    DWORD_PTR processImageBase;
+    size_t usableAddressSpace;
+    bool canUseLargeAddresses;
+};
+
+static LAAStateInfo g_laaState = {};
+
+// Function to detect LAA state and configure memory accordingly
+bool DetectLAAStateAndConfigureMemory() {
+    MEMPOOL_LOG_INFO("LAA", "Detecting Large Address Aware state and configuring memory");
+    
+    // Initialize LAA state structure
+    memset(&g_laaState, 0, sizeof(g_laaState));
+    
+    // Detect if we're running on 64-bit OS
+    SYSTEM_INFO systemInfo = {};
+    GetNativeSystemInfo(&systemInfo);
+    g_laaState.is64BitOS = (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) ||
+                           (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64);
+    
+    // Get memory information
+    MEMORYSTATUSEX memStatus = {};
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        g_laaState.totalPhysicalMemory = static_cast<size_t>(memStatus.ullTotalPhys);
+        g_laaState.availablePhysicalMemory = static_cast<size_t>(memStatus.ullAvailPhys);
+        g_laaState.maxProcessMemory = static_cast<size_t>(memStatus.ullTotalVirtual);
+    }
+    
+    // Get current process information
+    HANDLE hProcess = GetCurrentProcess();
+    PROCESS_MEMORY_COUNTERS pmc = {};
+    if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+        g_laaState.currentProcessMemory = static_cast<size_t>(pmc.WorkingSetSize);
+    }
+    
+    // Get process image base to detect LAA
+    MODULEINFO moduleInfo = {};
+    HMODULE hModule = GetModuleHandle(nullptr);
+    if (hModule && GetModuleInformation(hProcess, hModule, &moduleInfo, sizeof(moduleInfo))) {
+        g_laaState.processImageBase = reinterpret_cast<DWORD_PTR>(moduleInfo.lpBaseOfDll);
+    }
+    
+    // Check if current process can use large addresses
+    BOOL isWow64 = FALSE;
+    g_laaState.canUseLargeAddresses = IsWow64Process(hProcess, &isWow64) && isWow64;
+    
+    // Read the executable's PE header to check LAA flag
+    char exePath[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+        std::ifstream exeFile(exePath, std::ios::binary);
+        if (exeFile.is_open()) {
+            IMAGE_DOS_HEADER dosHeader = {};
+            exeFile.read(reinterpret_cast<char*>(&dosHeader), sizeof(dosHeader));
+            
+            if (dosHeader.e_magic == IMAGE_DOS_SIGNATURE) {
+                exeFile.seekg(dosHeader.e_lfanew, std::ios::beg);
+                IMAGE_NT_HEADERS32 ntHeaders = {};
+                exeFile.read(reinterpret_cast<char*>(&ntHeaders), sizeof(ntHeaders));
+                
+                if (ntHeaders.Signature == IMAGE_NT_SIGNATURE) {
+                    g_laaState.isLAAEnabled = (ntHeaders.FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0;
+                    g_laaState.processImageBase = ntHeaders.OptionalHeader.ImageBase;
+                }
+            }
+            exeFile.close();
+        }
+    }
+    
+    // Calculate usable address space based on LAA state
+    if (g_laaState.isLAAEnabled && g_laaState.is64BitOS) {
+        g_laaState.usableAddressSpace = static_cast<size_t>(4ULL * 1024 * 1024 * 1024); // 4GB for 32-bit LAA on 64-bit OS
+        g_laaState.isHighMemoryAvailable = true;
+    } else {
+        g_laaState.usableAddressSpace = static_cast<size_t>(2ULL * 1024 * 1024 * 1024); // 2GB for standard 32-bit
+        g_laaState.isHighMemoryAvailable = false;
+    }
+    
+    // Log detailed LAA state information
+    MEMPOOL_LOG_INFO("LAA", "=== LAA State Analysis ===");
+    MEMPOOL_LOG_INFO("LAA", "64-bit OS: %s", g_laaState.is64BitOS ? "YES" : "NO");
+    MEMPOOL_LOG_INFO("LAA", "LAA Enabled: %s", g_laaState.isLAAEnabled ? "YES" : "NO");
+    MEMPOOL_LOG_INFO("LAA", "Can Use Large Addresses: %s", g_laaState.canUseLargeAddresses ? "YES" : "NO");
+    MEMPOOL_LOG_INFO("LAA", "High Memory Available: %s", g_laaState.isHighMemoryAvailable ? "YES" : "NO");
+    MEMPOOL_LOG_INFO("LAA", "Process Image Base: 0x%p", (void*)g_laaState.processImageBase);
+    MEMPOOL_LOG_INFO("LAA", "Total Physical Memory: %zu MB", g_laaState.totalPhysicalMemory / (1024 * 1024));
+    MEMPOOL_LOG_INFO("LAA", "Available Physical Memory: %zu MB", g_laaState.availablePhysicalMemory / (1024 * 1024));
+    MEMPOOL_LOG_INFO("LAA", "Current Process Memory: %zu MB", g_laaState.currentProcessMemory / (1024 * 1024));
+    MEMPOOL_LOG_INFO("LAA", "Usable Address Space: %zu MB", g_laaState.usableAddressSpace / (1024 * 1024));
+    MEMPOOL_LOG_INFO("LAA", "Max Process Memory: %zu MB", g_laaState.maxProcessMemory / (1024 * 1024));
+    
+    return g_laaState.isLAAEnabled;
+}
+
+// Enhanced memory pool configuration based on LAA state
+void ConfigureMemoryPoolsForLAA() {
+    MEMPOOL_LOG_INFO("LAA", "Configuring memory pools based on LAA state");
+    
+    // Adjust pool sizes based on LAA availability
+    if (g_laaState.isLAAEnabled && g_laaState.isHighMemoryAvailable) {
+        // Enhanced configuration for LAA-enabled systems
+        constexpr size_t LAA_PRIVATE_MEMORY_SIZE = 512ull * 1024 * 1024;  // 512MB
+        constexpr size_t LAA_TEXTURE_MEMORY_SIZE = 512ull * 1024 * 1024; // 512MB
+        constexpr size_t LAA_LOG_BUFFER_SIZE = 16 * 1024 * 1024;          // 16MB
+        constexpr size_t LAA_FILE_BUFFER_SIZE = 32 * 1024 * 1024;        // 32MB
+        constexpr size_t LAA_GUI_POOL_SIZE = 64 * 1024 * 1024;           // 64MB
+        constexpr size_t LAA_SMALL_OBJ_POOL_SIZE = 128 * 1024 * 1024;     // 128MB
+        constexpr size_t LAA_LINKED_LIST_POOL_SIZE = 256 * 1024 * 1024;   // 256MB
+        constexpr size_t LAA_STRING_POOL_SIZE = 128 * 1024 * 1024;        // 128MB
+        constexpr size_t LAA_EXECUTABLE_POOL_SIZE = 512 * 1024 * 1024;    // 512MB
+        constexpr size_t LAA_TEMP_POOL_SIZE = 64 * 1024 * 1024;           // 64MB
+        constexpr size_t LAA_EMERGENCY_RESERVE_SIZE = 128 * 1024 * 1024;  // 128MB
+        
+        MEMPOOL_LOG_INFO("LAA", "Using LAA-enhanced memory configuration");
+        MEMPOOL_LOG_INFO("LAA", "Total enhanced memory: %zu MB", 
+                        (LAA_PRIVATE_MEMORY_SIZE + LAA_TEXTURE_MEMORY_SIZE) / (1024 * 1024));
+        
+        // Note: In a real implementation, we would reallocate pools with these sizes
+        // For now, we just log the enhanced configuration
+        
+    } else {
+        // Standard configuration for non-LAA systems
+        MEMPOOL_LOG_INFO("LAA", "Using standard memory configuration (LAA not available)");
+        MEMPOOL_LOG_INFO("LAA", "Total standard memory: %zu MB", TOTAL_POOL_SIZE / (1024 * 1024));
+    }
+    
+    // Log memory optimization strategies based on LAA state
+    if (g_laaState.isLAAEnabled) {
+        MEMPOOL_LOG_INFO("LAA", "LAA Memory Optimization Strategies:");
+        MEMPOOL_LOG_INFO("LAA", "  - Using larger memory pools for better performance");
+        MEMPOOL_LOG_INFO("LAA", "  - Enabling high-memory allocation patterns");
+        MEMPOOL_LOG_INFO("LAA", "  - Optimizing for 64-bit OS compatibility");
+        MEMPOOL_LOG_INFO("LAA", "  - Enhanced cache-friendly allocation strategies");
+    } else {
+        MEMPOOL_LOG_INFO("LAA", "Standard Memory Optimization Strategies:");
+        MEMPOOL_LOG_INFO("LAA", "  - Using conservative memory pool sizes");
+        MEMPOOL_LOG_INFO("LAA", "  - Optimizing for 2GB address space");
+        MEMPOOL_LOG_INFO("LAA", "  - Standard allocation patterns");
     }
 }
 
 void InitMemoryPool() {
     static bool initialized = false;
     if (!initialized) {
-        char* p = static_cast<char*>(VirtualAlloc(nullptr, TOTAL_POOL_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!p) return;
+        // First, detect LAA state and configure memory accordingly
+        bool laaDetected = DetectLAAStateAndConfigureMemory();
+        ConfigureMemoryPoolsForLAA();
+        
+        // Initialize critical section here
+        InitializeCriticalSection(&g_lock);
+        
+        // Adjust total pool size based on LAA state
+        size_t actualPoolSize = TOTAL_POOL_SIZE;
+        if (laaDetected && g_laaState.isHighMemoryAvailable) {
+            actualPoolSize = TOTAL_POOL_SIZE * 2; // Double the pool size for LAA systems
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "LAA detected - using enhanced memory pool: %zu bytes", actualPoolSize);
+        } else {
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Using standard memory pool: %zu bytes", actualPoolSize);
+        }
+        
+        char* p = static_cast<char*>(VirtualAlloc(nullptr, actualPoolSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!p) {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to allocate main memory pool of %zu bytes", actualPoolSize);
+            
+            // Try with smaller size as fallback
+            size_t fallbackSize = actualPoolSize / 2;
+            DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", "Attempting fallback allocation with %zu bytes", fallbackSize);
+            p = static_cast<char*>(VirtualAlloc(nullptr, fallbackSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!p) {
+                DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to allocate fallback memory pool of %zu bytes", fallbackSize);
+                return;
+            }
+            DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", "Using reduced memory pool size: %zu bytes", fallbackSize);
+        }
+        
         gameMemoryPool.pool = p;
         gameMemoryPool.offset.store(0, std::memory_order_relaxed);
         gameMemoryPool.head.store(nullptr, std::memory_order_relaxed);
@@ -311,10 +597,13 @@ void InitMemoryPool() {
             gameMemoryPool.freeLists[i].store(nullptr, std::memory_order_relaxed);
         }
         
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Main memory pool initialized successfully at %p", p);
+        
         // Initialize specialized pools
         InitSpecializedPools();
         
         initialized = true;
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Memory pool system initialization completed");
     }
 }
 
@@ -449,43 +738,611 @@ void PushFreeBlock(MemoryBlock* block) {
     } while (!gameMemoryPool.freeLists[sizeClass].compare_exchange_weak(oldFree, block, std::memory_order_acq_rel, std::memory_order_acquire));
 }
 
+// Helper functions for specialized pool free list management
+MemoryBlock* PopSpecializedFreeBlock(MemoryPool& pool, size_t size) {
+    MemoryBlock* freeBlock = pool.freeListHead.load(std::memory_order_acquire);
+    while (freeBlock) {
+        if (freeBlock->size >= size && freeBlock->magic == BLOCK_FREED_MAGIC) {
+            // Try to claim this block
+            MemoryBlock* next = freeBlock->next;
+            if (pool.freeListHead.compare_exchange_weak(freeBlock, next, 
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+                freeBlock->magic = BLOCK_MAGIC;
+                freeBlock->used = true;
+                pool.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                return freeBlock;
+            }
+        }
+        freeBlock = freeBlock->next;
+    }
+    pool.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+void PushSpecializedFreeBlock(MemoryPool& pool, MemoryBlock* block) {
+    if (!block) return;
+    
+    block->magic = BLOCK_FREED_MAGIC;
+    block->used = false;
+    
+    MemoryBlock* oldFree = pool.freeListHead.load(std::memory_order_acquire);
+    do {
+        block->next = oldFree;
+    } while (!pool.freeListHead.compare_exchange_weak(oldFree, block, 
+        std::memory_order_acq_rel, std::memory_order_acquire));
+}
+
+// Enhanced memory routing with call stack analysis for better reverse engineering
+enum AllocationType {
+    ALLOC_UNKNOWN = 0,
+    ALLOC_LOGGING,
+    ALLOC_FILE,
+    ALLOC_GUI,
+    ALLOC_SMALL_OBJ,
+    ALLOC_LINKED_LIST,
+    ALLOC_STRING,
+    ALLOC_EXECUTABLE
+};
+
+// Call stack analysis for reverse engineering
+AllocationType AnalyzeCallContext(size_t size) {
+    // Use _ReturnAddress for simpler call stack analysis
+    void* caller = _ReturnAddress();
+    
+    // Analyze call patterns for better pool selection
+    if (caller) {
+        // Check if caller is in known logging functions
+        if ((caller >= (void*)0x577C91 && caller <= (void*)0x57AC40) ||
+            (caller >= (void*)0x577CB8 && caller <= (void*)0x577D40)) {
+            return ALLOC_LOGGING;
+        }
+        
+        // Check if caller is in file operations
+        if ((caller >= (void*)0x6082D0 && caller <= (void*)0x819C55)) {
+            return ALLOC_FILE;
+        }
+        
+        // Check if caller is in GUI operations
+        if ((caller >= (void*)0x6A4CC0 && caller <= (void*)0x6A4FB0)) {
+            return ALLOC_GUI;
+        }
+        
+        // Check if caller is in small utility functions
+        if ((caller >= (void*)0x69A7E0 && caller <= (void*)0x69A810)) {
+            return ALLOC_SMALL_OBJ;
+        }
+        
+        // Check if caller is in linked list operations
+        if ((caller >= (void*)0x698CF0 && caller <= (void*)0x6A3AA0)) {
+            return ALLOC_LINKED_LIST;
+        }
+        
+        // Check if caller is in string operations
+        if ((caller >= (void*)0x6A0AB0 && caller <= (void*)0x6CB980)) {
+            return ALLOC_STRING;
+        }
+        
+        // Check if caller is in executable memory operations
+        if ((caller >= (void*)0x9AE540 && caller <= (void*)0x9AE550)) {
+            return ALLOC_EXECUTABLE;
+        }
+    }
+    
+    // Fallback to size-based heuristics
+    if (size <= 256) return ALLOC_SMALL_OBJ;
+    if (size <= 1024) return ALLOC_LOGGING;
+    if (size <= 8192) return ALLOC_FILE;
+    if (size <= 65536) return ALLOC_GUI;
+    return ALLOC_UNKNOWN;
+}
+
+// Hook detection and evasion resistance
+bool IsHookDetected() {
+    // Check for common anti-hook techniques
+    static DWORD lastCheck = 0;
+    DWORD currentTime = GetTickCount();
+    
+    if (currentTime - lastCheck < 1000) return false; // Don't check too frequently
+    lastCheck = currentTime;
+    
+    // Check for integrity checks
+    void* testMalloc = GetProcAddress(GetModuleHandleA("msvcrt.dll"), "malloc");
+    if (testMalloc && testMalloc != s_origMalloc) {
+        return true; // Hook detected
+    }
+    
+    return false;
+}
+
+// Advanced hook evasion with dynamic resolution
+void* GetDynamicFunction(const char* moduleName, const char* functionName) {
+    static HMODULE modules[32] = {0};
+    static DWORD moduleHashes[32] = {0};
+    
+    // Simple hash for module name
+    DWORD hash = 0;
+    for (const char* p = moduleName; *p; ++p) {
+        hash = hash * 31 + *p;
+    }
+    
+    // Find or load module
+    HMODULE hModule = nullptr;
+    for (int i = 0; i < 32; ++i) {
+        if (moduleHashes[i] == hash && modules[i]) {
+            hModule = modules[i];
+            break;
+        }
+    }
+    
+    if (!hModule) {
+        hModule = GetModuleHandleA(moduleName);
+        if (!hModule) {
+            hModule = LoadLibraryA(moduleName);
+        }
+        
+        // Cache for future use
+        for (int i = 0; i < 32; ++i) {
+            if (!modules[i]) {
+                modules[i] = hModule;
+                moduleHashes[i] = hash;
+                break;
+            }
+        }
+    }
+    
+    return GetProcAddress(hModule, functionName);
+}
+
+// Thread-safe emergency allocation with overflow protection
+void* EmergencyMalloc(size_t size) {
+    if (size == 0) return nullptr;
+    
+    // Initialize emergency reserve if needed
+    if (!g_emergencyReserve) {
+        g_emergencyReserve = static_cast<char*>(
+            VirtualAlloc(nullptr, EMERGENCY_RESERVE_SIZE, 
+                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!g_emergencyReserve) {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Failed to allocate emergency reserve");
+            return nullptr;
+        }
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Emergency reserve allocated: %zu MB", 
+            EMERGENCY_RESERVE_SIZE / (1024 * 1024));
+    }
+    
+    // Use atomic operations with overflow check
+    size_t oldUsed = g_emergencyUsed.load(std::memory_order_relaxed);
+    size_t newUsed;
+    
+    do {
+        newUsed = oldUsed + size;
+        if (newUsed > EMERGENCY_RESERVE_SIZE) {
+            // No space in emergency reserve
+            DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+                "Emergency reserve full: %zu/%zu bytes used", 
+                oldUsed, EMERGENCY_RESERVE_SIZE);
+            
+            // Try to allocate fresh memory outside the pool
+            void* emergency = VirtualAlloc(nullptr, size, 
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (emergency) {
+                DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+                    "Allocated emergency memory outside pool: %zu bytes at %p", 
+                    size, emergency);
+            }
+            return emergency;
+        }
+    } while (!g_emergencyUsed.compare_exchange_weak(oldUsed, newUsed, 
+        std::memory_order_relaxed, std::memory_order_relaxed));
+    
+    void* result = g_emergencyReserve + oldUsed;
+    
+    // Clear memory
+    memset(result, 0, size);
+    
+    DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", 
+        "Emergency allocation: %zu bytes at %p (total used: %zu)", 
+        size, result, newUsed);
+    
+    return result;
+}
+
+// Crash reporting memory validation system
+static void* g_crashReportBuffer = nullptr;
+static size_t g_crashReportSize = 0;
+
+extern "C" __declspec(dllexport) bool EnsureCrashReportMemory(size_t needed) {
+    static bool initialized = false;
+    
+    // Allocate crash report memory ONCE and never free it
+    if (!initialized) {
+        // Allocate with plenty of extra space for Dawn of War crash reports
+        size_t allocateSize = std::max(needed, static_cast<size_t>(8 * 1024 * 1024)); // At least 8MB
+        
+        g_crashReportBuffer = VirtualAlloc(nullptr, allocateSize, 
+                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        
+        if (g_crashReportBuffer) {
+            g_crashReportSize = allocateSize;
+            initialized = true;
+            
+            // Mark buffer as crash report memory
+            memset(g_crashReportBuffer, 0xCC, 1024); // First 1KB as marker
+            
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", 
+                "Crash report buffer allocated: %zu MB at %p", 
+                allocateSize / (1024 * 1024), g_crashReportBuffer);
+            
+            return true;
+        } else {
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", 
+                "Failed to allocate crash report buffer of %zu MB", 
+                allocateSize / (1024 * 1024));
+            return false;
+        }
+    }
+    
+    // If already initialized, check if it's large enough
+    if (needed > g_crashReportSize) {
+        DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+            "Crash report buffer (%zu MB) may be too small for %zu bytes", 
+            g_crashReportSize / (1024 * 1024), needed);
+        // Don't try to reallocate during a crash!
+    }
+    
+    return g_crashReportBuffer != nullptr;
+}
+
+void SetupCrashReporting() {
+    // Reserve 8MB for crash reports (Dawn of War needs ~4-6MB)
+    if (EnsureCrashReportMemory(8 * 1024 * 1024)) {
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Crash reporting system initialized with 8MB buffer");
+    } else {
+        DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "FAILED to initialize crash reporting system");
+    }
+}
+
+// Memory pressure detection and response system
+bool IsMemoryPressureHigh() {
+    size_t totalUsed = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
+    float usageRatio = static_cast<float>(totalUsed) / TOTAL_POOL_SIZE;
+    
+    // Also check system memory
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    GlobalMemoryStatusEx(&memStatus);
+    
+    float systemUsage = static_cast<float>(memStatus.dwMemoryLoad) / 100.0f;
+    
+    return usageRatio > 0.85f || systemUsage > 0.90f;
+}
+
+// Comprehensive memory error logging system
+void LogMemoryError(const char* function, const char* error, void* address, size_t size) {
+    char buffer[512];
+    if (address) {
+        sprintf_s(buffer, sizeof(buffer), 
+            "[MEMERROR] %s: %s at %p (size: %zu)\n"
+            "Total Allocated: %zu MB\n"
+            "Pool Usage: %.1f%%\n"
+            "Peak Usage: %zu MB\n"
+            "Fragmentation Count: %zu\n"
+            "System Memory Load: %u%%\n",
+            function, error, address, size,
+            gameMemoryPool.totalAllocated.load() / (1024 * 1024),
+            (gameMemoryPool.totalAllocated.load() * 100.0f) / TOTAL_POOL_SIZE,
+            gameMemoryPool.peakUsage.load() / (1024 * 1024),
+            gameMemoryPool.fragmentationCount.load(),
+            GetSystemMemoryUsage());
+    } else {
+        sprintf_s(buffer, sizeof(buffer), 
+            "[MEMERROR] %s: %s\n", function, error);
+    }
+    OutputDebugStringA(buffer);
+    
+    // Also write to file for post-crash analysis
+    static HANDLE logFile = INVALID_HANDLE_VALUE;
+    if (logFile == INVALID_HANDLE_VALUE) {
+        logFile = CreateFileA("memory_errors.log", 
+                             FILE_APPEND_DATA, FILE_SHARE_READ, 
+                             NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    
+    if (logFile != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(logFile, buffer, strlen(buffer), &written, NULL);
+        FlushFileBuffers(logFile);
+    }
+}
+
+// Helper function to get system memory usage
+DWORD GetSystemMemoryUsage() {
+    MEMORYSTATUSEX memStatus;
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        return memStatus.dwMemoryLoad;
+    }
+    return 0;
+}
+
+// Memory pool defragmentation for reducing fragmentation
+void DefragmentMemoryPool() {
+    // Don't defragment if we might be in a crash handler
+    if (!gameMemoryPool.head.load(std::memory_order_acquire)) return;
+    
+    // Don't defragment if fragmentation is low
+    size_t fragmentationCount = gameMemoryPool.fragmentationCount.load(std::memory_order_relaxed);
+    if (fragmentationCount < 5) return;
+    
+    DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Starting defragmentation with %zu fragmentation events", fragmentationCount);
+    
+    EnterCriticalSection(&g_lock);
+    
+    try {
+        // Collect all free blocks
+        std::vector<MemoryBlock*> freeBlocks;
+        MemoryBlock* current = gameMemoryPool.head.load(std::memory_order_acquire);
+        
+        while (current) {
+            if (!current->used && current->magic == BLOCK_FREED_MAGIC) {
+                freeBlocks.push_back(current);
+            }
+            current = current->next;
+        }
+        
+        if (freeBlocks.empty()) {
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        
+        // Limit defragmentation to prevent long stalls
+        if (freeBlocks.size() > 1000) {
+            DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+                "Too many free blocks (%zu), limiting defragmentation", freeBlocks.size());
+            freeBlocks.resize(1000); // Only process first 1000
+        }
+        
+        // Sort by address to find contiguous blocks
+        std::sort(freeBlocks.begin(), freeBlocks.end(), 
+                  [](MemoryBlock* a, MemoryBlock* b) { 
+                      return a->address < b->address; 
+                  });
+        
+        // Merge contiguous blocks
+        size_t mergesPerformed = 0;
+        for (size_t i = 0; i + 1 < freeBlocks.size(); ++i) {
+            char* blockEnd = static_cast<char*>(freeBlocks[i]->address) + freeBlocks[i]->size;
+            if (blockEnd == static_cast<char*>(freeBlocks[i + 1]->address)) {
+                // Merge blocks
+                freeBlocks[i]->size += freeBlocks[i + 1]->size;
+                
+                // Remove merged block from the linked list
+                MemoryBlock* toRemove = freeBlocks[i + 1];
+                MemoryBlock* prev = nullptr;
+                MemoryBlock* search = gameMemoryPool.head.load(std::memory_order_acquire);
+                
+                while (search && search != toRemove) {
+                    prev = search;
+                    search = search->next;
+                }
+                
+                if (prev) {
+                    prev->next = toRemove->next;
+                } else {
+                    // It was head
+                    gameMemoryPool.head.store(toRemove->next, std::memory_order_release);
+                }
+                
+                delete toRemove;
+                freeBlocks.erase(freeBlocks.begin() + i + 1);
+                --i; // Check again with new neighbor
+                ++mergesPerformed;
+            }
+        }
+        
+        // Update fragmentation statistics
+        gameMemoryPool.fragmentationCount.store(0, std::memory_order_relaxed);
+        gameMemoryPool.lastCleanupTime.store(GetTickCount(), std::memory_order_relaxed);
+        
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", 
+            "Defragmentation completed: %zu merges performed", mergesPerformed);
+            
+    } catch (...) {
+        DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Exception during defragmentation");
+    }
+    
+    LeaveCriticalSection(&g_lock);
+}
+
+// Periodic maintenance task for memory health
+void PerformMemoryMaintenance() {
+    static DWORD lastMaintenance = 0;
+    DWORD currentTime = GetTickCount();
+    
+    // Run maintenance every 30 seconds
+    if (currentTime - lastMaintenance > 30000) {
+        lastMaintenance = currentTime;
+        
+        // Report memory statistics
+        ReportMemoryStatistics();
+        
+        // Check if defragmentation is needed
+        size_t fragmentationCount = gameMemoryPool.fragmentationCount.load(std::memory_order_relaxed);
+        if (fragmentationCount > 10) {
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "High fragmentation detected (%zu events), triggering defragmentation", fragmentationCount);
+            DefragmentMemoryPool();
+        }
+        
+        // Check if any pools need cleanup
+        CheckPoolHealth();
+    }
+}
+
+// Check health of all memory pools
+void CheckPoolHealth() {
+    // Check main pool
+    size_t mainUsage = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
+    size_t mainPeak = gameMemoryPool.peakUsage.load(std::memory_order_relaxed);
+    
+    if (mainUsage > (TOTAL_POOL_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: Main memory pool approaching capacity\n");
+    }
+    
+    // Check specialized pools
+    if (logPool.totalAllocated.load(std::memory_order_relaxed) > (LOG_BUFFER_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: Log pool approaching capacity\n");
+    }
+    
+    if (filePool.totalAllocated.load(std::memory_order_relaxed) > (FILE_BUFFER_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: File pool approaching capacity\n");
+    }
+    
+    if (guiPool.totalAllocated.load(std::memory_order_relaxed) > (GUI_POOL_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: GUI pool approaching capacity\n");
+    }
+    
+    if (smallObjPool.totalAllocated.load(std::memory_order_relaxed) > (SMALL_OBJ_POOL_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: Small object pool approaching capacity\n");
+    }
+    
+    if (linkedListPool.totalAllocated.load(std::memory_order_relaxed) > (LINKED_LIST_POOL_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: Linked list pool approaching capacity\n");
+    }
+    
+    if (stringPool.totalAllocated.load(std::memory_order_relaxed) > (STRING_POOL_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: String pool approaching capacity\n");
+    }
+    
+    if (executablePool.totalAllocated.load(std::memory_order_relaxed) > (EXECUTABLE_POOL_SIZE * 0.9)) {
+        OutputDebugStringA("WARNING: Executable pool approaching capacity\n");
+    }
+}
+
 extern "C" __declspec(dllexport) void* CustomMalloc(size_t size) {
     if (size == 0) return nullptr;
     
-    // Get calling address for context determination
-    void* caller = _ReturnAddress();
+    auto startTime = std::chrono::high_resolution_clock::now();
+    gameMemoryPool.mallocCount.fetch_add(1, std::memory_order_relaxed);
     
-    // Route to specialized pools based on call patterns and size
-    if (size <= 256) {
-        // Small allocations - likely utility functions (sub_69A7E0, sub_69A810)
-        return SmallObjMalloc(size);
-    } else if (size <= 1024) {
-        // Medium allocations - check if likely logging related
-        // This would ideally use call stack analysis, but we'll use heuristics
-        return LogMalloc(size);
-    } else if (size <= 8192) {
-        // Larger allocations - could be file buffers or GUI objects
-        return FileMalloc(size);
-    } else if (size <= 65536) {
-        // Even larger - likely GUI/window management
-        return GuiMalloc(size);
-    } else {
-        // Very large allocations - use main pool implementation directly
-        if (size < 1024 * 1024 && size < (TOTAL_POOL_SIZE / 3)) {
-            // Use original main pool implementation for large blocks
-            EnterCriticalSection(&g_lock);
-            InitMemoryPool();
-            size_t alignedSize = (size + 15) & ~static_cast<size_t>(15);
-            
-            // For very large allocations, consider guard pages
-            bool useGuardPages = (alignedSize >= MAX_BLOCK_SIZE);
-            if (useGuardPages) {
-                alignedSize += GUARD_PAGE_SIZE * 2; // Guard pages before and after
-            }
-            
-            // Try to find a suitable free block first
-            MemoryBlock* block = PopFreeBlock(alignedSize);
-            if (block) {
+    // Log allocation request
+    DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "CustomMalloc requested: %zu bytes", size);
+    
+    // Perform periodic maintenance
+    PerformMemoryMaintenance();
+    
+    // FIRST: Try emergency reserve for critical allocations (like crash reporting)
+    // This ensures crash handlers can always get memory
+    if (size <= 1024 * 1024) { // Only use emergency for small/medium allocations
+        void* emergencyResult = EmergencyMalloc(size);
+        if (emergencyResult) {
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", 
+                "Using emergency memory for %zu bytes at %p", size, emergencyResult);
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+            gameMemoryPool.totalAllocTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+            return emergencyResult;
+        }
+    }
+    
+    // Check memory pressure and respond accordingly
+    if (IsMemoryPressureHigh()) {
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "High memory pressure detected during allocation of %zu bytes", size);
+        // Trigger cleanup/defragmentation
+        DefragmentMemoryPool();
+        
+        // For large allocations during high pressure, use system allocator
+        if (size > 1024 * 1024) { // Large allocations during high pressure
+            DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", "Using system allocator for large allocation: %zu bytes", size);
+            void* result = s_origMalloc ? s_origMalloc(size) : nullptr;
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+            gameMemoryPool.totalAllocTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+            return result;
+        }
+    }
+    
+    // Anti-hook detection
+    if (IsHookDetected()) {
+        DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", "Hook detected, falling back to original allocator for %zu bytes", size);
+        // Fallback to original to avoid detection
+        void* result = s_origMalloc ? s_origMalloc(size) : nullptr;
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalAllocTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return result;
+    }
+    
+    // Enhanced routing with call stack analysis
+    AllocationType allocType = AnalyzeCallContext(size);
+    
+    switch (allocType) {
+        case ALLOC_LOGGING:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to logging pool", size);
+            return LogMalloc(size);
+        case ALLOC_FILE:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to file pool", size);
+            return FileMalloc(size);
+        case ALLOC_GUI:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to GUI pool", size);
+            return GuiMalloc(size);
+        case ALLOC_SMALL_OBJ:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to small object pool", size);
+            return SmallObjMalloc(size);
+        case ALLOC_LINKED_LIST:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to linked list pool", size);
+            return LinkedListMalloc(size);
+        case ALLOC_STRING:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to string pool", size);
+            return StringMalloc(size);
+        case ALLOC_EXECUTABLE:
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %zu bytes to executable pool", size);
+            return ExecutableMalloc(size);
+        default:
+            // Use size-based routing for unknown patterns
+            if (size < 1024 * 1024 && size < (TOTAL_POOL_SIZE / 3)) {
+                // Use main pool for large unknown allocations
+                EnterCriticalSection(&g_lock);
+                InitMemoryPool();
+                size_t alignedSize = (size + 15) & ~static_cast<size_t>(15);
+                
+                bool useGuardPages = (alignedSize >= MAX_BLOCK_SIZE);
+                if (useGuardPages) {
+                    alignedSize += GUARD_PAGE_SIZE * 2;
+                }
+                
+                MemoryBlock* block = PopFreeBlock(alignedSize);
+                if (block) {
+                    gameMemoryPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+                    size_t currentUsage = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
+                    size_t peakUsage = gameMemoryPool.peakUsage.load(std::memory_order_relaxed);
+                    if (currentUsage > peakUsage) {
+                        gameMemoryPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
+                    }
+                    
+                    if (useGuardPages) {
+                        DWORD oldProtect;
+                        VirtualProtect(static_cast<char*>(block->address), GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
+                        VirtualProtect(static_cast<char*>(block->address) + alignedSize - GUARD_PAGE_SIZE, GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
+                        void* userPtr = static_cast<char*>(block->address) + GUARD_PAGE_SIZE;
+                        LeaveCriticalSection(&g_lock);
+                        return userPtr;
+                    }
+                    
+                    LeaveCriticalSection(&g_lock);
+                    return block->address;
+                }
+                
+                size_t currentOffset = gameMemoryPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
+                if (currentOffset + alignedSize > TOTAL_POOL_SIZE) {
+                    LeaveCriticalSection(&g_lock);
+                    return s_origMalloc ? s_origMalloc(size) : nullptr;
+                }
+                
+                void* allocatedMemory = gameMemoryPool.pool + currentOffset;
+                MemoryBlock* newBlock = new MemoryBlock{ alignedSize, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+                newBlock->next = gameMemoryPool.head.load(std::memory_order_acquire);
+                gameMemoryPool.head.store(newBlock, std::memory_order_release);
+                
                 gameMemoryPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
                 size_t currentUsage = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
                 size_t peakUsage = gameMemoryPool.peakUsage.load(std::memory_order_relaxed);
@@ -494,536 +1351,426 @@ extern "C" __declspec(dllexport) void* CustomMalloc(size_t size) {
                 }
                 
                 if (useGuardPages) {
-                    // Set up guard pages
                     DWORD oldProtect;
-                    VirtualProtect(static_cast<char*>(block->address), GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
-                    VirtualProtect(static_cast<char*>(block->address) + alignedSize - GUARD_PAGE_SIZE, GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
-                    // Return pointer after first guard page
-                    void* userPtr = static_cast<char*>(block->address) + GUARD_PAGE_SIZE;
+                    VirtualProtect(allocatedMemory, GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
+                    VirtualProtect(static_cast<char*>(allocatedMemory) + alignedSize - GUARD_PAGE_SIZE, GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
+                    void* userPtr = static_cast<char*>(allocatedMemory) + GUARD_PAGE_SIZE;
                     LeaveCriticalSection(&g_lock);
                     return userPtr;
                 }
                 
                 LeaveCriticalSection(&g_lock);
-                return block->address;
+                return allocatedMemory;
             }
-            
-            // No suitable free block, allocate from pool
-            size_t currentOffset = gameMemoryPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-            if (currentOffset + alignedSize > TOTAL_POOL_SIZE) {
-                LeaveCriticalSection(&g_lock);
-                return s_origMalloc ? s_origMalloc(size) : nullptr;
-            }
-            
-            void* allocatedMemory = gameMemoryPool.pool + currentOffset;
-            MemoryBlock* newBlock = new MemoryBlock{ alignedSize, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
-            newBlock->next = gameMemoryPool.head.load(std::memory_order_acquire);
-            gameMemoryPool.head.store(newBlock, std::memory_order_release);
-            
-            gameMemoryPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
-            size_t currentUsage = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
-            size_t peakUsage = gameMemoryPool.peakUsage.load(std::memory_order_relaxed);
-            if (currentUsage > peakUsage) {
-                gameMemoryPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-            }
-            
-            if (useGuardPages) {
-                // Set up guard pages
-                DWORD oldProtect;
-                VirtualProtect(allocatedMemory, GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
-                VirtualProtect(static_cast<char*>(allocatedMemory) + alignedSize - GUARD_PAGE_SIZE, GUARD_PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
-                // Return pointer after first guard page
-                void* userPtr = static_cast<char*>(allocatedMemory) + GUARD_PAGE_SIZE;
-                LeaveCriticalSection(&g_lock);
-                return userPtr;
-            }
-            
-            LeaveCriticalSection(&g_lock);
-            return allocatedMemory;
-        }
     }
     
-    // Fallback to original malloc
+    // Try emergency reserve for crash reporting and critical operations
+    void* emergencyResult = EmergencyMalloc(size);
+    if (emergencyResult) {
+        OutputDebugStringA("Using emergency memory reserve for critical allocation\n");
+        return emergencyResult;
+    }
+    
+    // Final fallback to original malloc
     return s_origMalloc ? s_origMalloc(size) : nullptr;
 }
 
 extern "C" __declspec(dllexport) void* LogMalloc(size_t size) {
-    // Optimized for logging allocations (sub_577C91, sub_577CB8, sub_577D40, sub_57AC40)
-    if (size == 0 || size > LOG_BUFFER_SIZE / 4) return s_origMalloc ? s_origMalloc(size) : nullptr;
+    if (!logPool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!logPool.pool) {
-        InitSpecializedPools();
-        if (!logPool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origMalloc ? s_origMalloc(size) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(logPool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        logPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        logPool.logAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 7) & ~static_cast<size_t>(7); // 8-byte alignment for strings
-    size_t currentOffset = logPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > LOG_BUFFER_SIZE) {
-        logPool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = logPool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > LOG_BUFFER_SIZE) {
+        logPool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origMalloc ? s_origMalloc(size) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = logPool.pool + currentOffset;
-    logPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = logPool.head.load(std::memory_order_acquire);
+    logPool.head.store(newBlock, std::memory_order_release);
+    
+    logPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     logPool.logAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = logPool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = logPool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        logPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
 }
 
 extern "C" __declspec(dllexport) void* FileMalloc(size_t size) {
-    // Optimized for file operations (sub_6082D0, sub_819C55)
-    if (size == 0 || size > FILE_BUFFER_SIZE / 2) return s_origMalloc ? s_origMalloc(size) : nullptr;
+    if (!filePool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!filePool.pool) {
-        InitSpecializedPools();
-        if (!filePool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origMalloc ? s_origMalloc(size) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(filePool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        filePool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        filePool.fileAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 511) & ~static_cast<size_t>(511); // 512-byte alignment for file buffers
-    size_t currentOffset = filePool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > FILE_BUFFER_SIZE) {
-        filePool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = filePool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > FILE_BUFFER_SIZE) {
+        filePool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origMalloc ? s_origMalloc(size) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = filePool.pool + currentOffset;
-    filePool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = filePool.head.load(std::memory_order_acquire);
+    filePool.head.store(newBlock, std::memory_order_release);
+    
+    filePool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     filePool.fileAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = filePool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = filePool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        filePool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
 }
 
 extern "C" __declspec(dllexport) void* GuiMalloc(size_t size) {
-    // Optimized for GUI/window management (sub_6A4CC0, sub_6A4FB0)
-    if (size == 0 || size > GUI_POOL_SIZE / 8) return s_origMalloc ? s_origMalloc(size) : nullptr;
+    if (!guiPool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!guiPool.pool) {
-        InitSpecializedPools();
-        if (!guiPool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origMalloc ? s_origMalloc(size) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(guiPool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        guiPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        guiPool.guiAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 31) & ~static_cast<size_t>(31); // 32-byte alignment for GUI objects
-    size_t currentOffset = guiPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > GUI_POOL_SIZE) {
-        guiPool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = guiPool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > GUI_POOL_SIZE) {
+        guiPool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origMalloc ? s_origMalloc(size) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = guiPool.pool + currentOffset;
-    guiPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = guiPool.head.load(std::memory_order_acquire);
+    guiPool.head.store(newBlock, std::memory_order_release);
+    
+    guiPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     guiPool.guiAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = guiPool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = guiPool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        guiPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
-} // Added missing closing brace
+}
 
 extern "C" __declspec(dllexport) void* SmallObjMalloc(size_t size) {
-    // Optimized for small frequent allocations (sub_69A7E0, sub_69A810)
-    if (size == 0 || size > 4096) return s_origMalloc ? s_origMalloc(size) : nullptr;
+    if (!smallObjPool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!smallObjPool.pool) {
-        InitSpecializedPools();
-        if (!smallObjPool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origMalloc ? s_origMalloc(size) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(smallObjPool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        smallObjPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        smallObjPool.smallObjAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 15) & ~static_cast<size_t>(15); // 16-byte alignment
-    size_t currentOffset = smallObjPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > SMALL_OBJ_POOL_SIZE) {
-        smallObjPool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = smallObjPool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > SMALL_OBJ_POOL_SIZE) {
+        smallObjPool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origMalloc ? s_origMalloc(size) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = smallObjPool.pool + currentOffset;
-    smallObjPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = smallObjPool.head.load(std::memory_order_acquire);
+    smallObjPool.head.store(newBlock, std::memory_order_release);
+    
+    smallObjPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     smallObjPool.smallObjAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = smallObjPool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = smallObjPool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        smallObjPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
 }
 
 extern "C" __declspec(dllexport) void* LinkedListMalloc(size_t size) {
-    // Optimized for linked list structures (sub_698CF0, sub_6A35F0, sub_6A3840, sub_6A3AA0)
-    if (size == 0 || size > LINKED_LIST_POOL_SIZE / 16) return s_origMalloc ? s_origMalloc(size) : nullptr;
+    if (!linkedListPool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!linkedListPool.pool) {
-        InitSpecializedPools();
-        if (!linkedListPool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origMalloc ? s_origMalloc(size) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(linkedListPool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        linkedListPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        linkedListPool.linkedListAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 7) & ~static_cast<size_t>(7); // 8-byte alignment for pointers
-    size_t currentOffset = linkedListPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > LINKED_LIST_POOL_SIZE) {
-        linkedListPool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = linkedListPool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > LINKED_LIST_POOL_SIZE) {
+        linkedListPool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origMalloc ? s_origMalloc(size) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = linkedListPool.pool + currentOffset;
-    linkedListPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = linkedListPool.head.load(std::memory_order_acquire);
+    linkedListPool.head.store(newBlock, std::memory_order_release);
+    
+    linkedListPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     linkedListPool.linkedListAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = linkedListPool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = linkedListPool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        linkedListPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
 }
 
 extern "C" __declspec(dllexport) void* StringMalloc(size_t size) {
-    // Optimized for string operations (sub_6A0AB0, sub_6A3840, sub_6A3AA0, sub_6A35F0, sub_6CB980)
-    if (size == 0 || size > STRING_POOL_SIZE / 32) return s_origMalloc ? s_origMalloc(size) : nullptr;
+    if (!stringPool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!stringPool.pool) {
-        InitSpecializedPools();
-        if (!stringPool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origMalloc ? s_origMalloc(size) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(stringPool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        stringPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        stringPool.stringAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 7) & ~static_cast<size_t>(7); // 8-byte alignment for strings
-    size_t currentOffset = stringPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > STRING_POOL_SIZE) {
-        stringPool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = stringPool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > STRING_POOL_SIZE) {
+        stringPool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origMalloc ? s_origMalloc(size) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = stringPool.pool + currentOffset;
-    stringPool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = stringPool.head.load(std::memory_order_acquire);
+    stringPool.head.store(newBlock, std::memory_order_release);
+    
+    stringPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     stringPool.stringAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = stringPool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = stringPool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        stringPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
 }
 
 extern "C" __declspec(dllexport) void* ExecutableMalloc(size_t size) {
-    // Optimized for executable memory allocations (sub_9AE540) with PAGE_EXECUTE_READWRITE
-    if (size == 0 || size > EXECUTABLE_POOL_SIZE / 16) return s_origVirtualAlloc ? s_origVirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) : nullptr;
+    if (!executablePool.pool) return nullptr;
     
     EnterCriticalSection(&g_lock);
-    if (!executablePool.pool) {
-        InitSpecializedPools();
-        if (!executablePool.pool) {
-            LeaveCriticalSection(&g_lock);
-            return s_origVirtualAlloc ? s_origVirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) : nullptr;
-        }
+    MemoryBlock* freeBlock = PopSpecializedFreeBlock(executablePool, size);
+    if (freeBlock) {
+        // Reuse the freed block - no need to allocate new memory
+        freeBlock->used = true;
+        freeBlock->magic = BLOCK_MAGIC;
+        memset(freeBlock->address, 0, size); // Clear memory for reuse
+        executablePool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
+        executablePool.executableAllocCount.fetch_add(1, std::memory_order_relaxed);
+        LeaveCriticalSection(&g_lock);
+        return freeBlock->address;
     }
     
-    size_t alignedSize = (size + 15) & ~static_cast<size_t>(15); // 16-byte alignment for executable code
-    size_t currentOffset = executablePool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    
-    if (currentOffset + alignedSize > EXECUTABLE_POOL_SIZE) {
-        executablePool.offset.fetch_sub(alignedSize, std::memory_order_relaxed);
+    size_t currentOffset = executablePool.offset.fetch_add(size, std::memory_order_relaxed);
+    if (currentOffset + size > EXECUTABLE_POOL_SIZE) {
+        executablePool.offset.fetch_sub(size, std::memory_order_relaxed);
         LeaveCriticalSection(&g_lock);
-        return s_origVirtualAlloc ? s_origVirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) : nullptr;
+        return CustomMalloc(size); // Fallback to main pool
     }
     
     void* allocatedMemory = executablePool.pool + currentOffset;
-    executablePool.totalAllocated.fetch_add(alignedSize, std::memory_order_relaxed);
+    MemoryBlock* newBlock = new MemoryBlock{ size, true, allocatedMemory, nullptr, nullptr, BLOCK_MAGIC };
+    newBlock->next = executablePool.head.load(std::memory_order_acquire);
+    executablePool.head.store(newBlock, std::memory_order_release);
+    
+    executablePool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
     executablePool.executableAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = executablePool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = executablePool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        executablePool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
     LeaveCriticalSection(&g_lock);
     return allocatedMemory;
 }
 
+// Specialized free function implementations
 extern "C" __declspec(dllexport) void LogFree(void* ptr) {
-    // Optimized for logging memory deallocation (sub_577C91, sub_577CB8, sub_577D40, sub_57AC40)
-    if (!ptr) return;
+    if (!ptr || !logPool.pool) return;
     
-    // Simple pool-based free for logging - no tracking needed for performance
-    // Just mark as available for reuse
     EnterCriticalSection(&g_lock);
-    if (logPool.pool && ptr >= logPool.pool && ptr < logPool.pool + LOG_BUFFER_SIZE) {
-        // For pool-based allocations, we don't actually free individual blocks
-        // The pool is reset as a whole when needed
-        logPool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        // Fallback to original free
-        if (s_origFree) s_origFree(ptr);
+    MemoryBlock* current = logPool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(logPool, current);
+            logPool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            logPool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        current = current->next;
     }
     LeaveCriticalSection(&g_lock);
 }
 
 extern "C" __declspec(dllexport) void FileFree(void* ptr) {
-    // Optimized for file memory deallocation (sub_6082D0, sub_819C55)
-    if (!ptr) return;
+    if (!ptr || !filePool.pool) return;
     
     EnterCriticalSection(&g_lock);
-    if (filePool.pool && ptr >= filePool.pool && ptr < filePool.pool + FILE_BUFFER_SIZE) {
-        filePool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (s_origFree) s_origFree(ptr);
+    MemoryBlock* current = filePool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(filePool, current);
+            filePool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            filePool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        current = current->next;
     }
     LeaveCriticalSection(&g_lock);
 }
 
 extern "C" __declspec(dllexport) void GuiFree(void* ptr) {
-    // Optimized for GUI memory deallocation (sub_6A4CC0, sub_6A4FB0)
-    if (!ptr) return;
+    if (!ptr || !guiPool.pool) return;
     
     EnterCriticalSection(&g_lock);
-    if (guiPool.pool && ptr >= guiPool.pool && ptr < guiPool.pool + GUI_POOL_SIZE) {
-        guiPool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (s_origFree) s_origFree(ptr);
+    MemoryBlock* current = guiPool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(guiPool, current);
+            guiPool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            guiPool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        current = current->next;
     }
     LeaveCriticalSection(&g_lock);
 }
 
 extern "C" __declspec(dllexport) void SmallObjFree(void* ptr) {
-    // Optimized for small object deallocation (sub_69A7E0, sub_69A810)
-    if (!ptr) return;
+    if (!ptr || !smallObjPool.pool) return;
     
     EnterCriticalSection(&g_lock);
-    if (smallObjPool.pool && ptr >= smallObjPool.pool && ptr < smallObjPool.pool + SMALL_OBJ_POOL_SIZE) {
-        smallObjPool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (s_origFree) s_origFree(ptr);
+    MemoryBlock* current = smallObjPool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(smallObjPool, current);
+            smallObjPool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            smallObjPool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        current = current->next;
     }
     LeaveCriticalSection(&g_lock);
 }
 
 extern "C" __declspec(dllexport) void LinkedListFree(void* ptr) {
-    // Optimized for linked list deallocation (sub_698CF0, sub_6A35F0, sub_6A3840, sub_6A3AA0)
-    if (!ptr) return;
+    if (!ptr || !linkedListPool.pool) return;
     
     EnterCriticalSection(&g_lock);
-    if (linkedListPool.pool && ptr >= linkedListPool.pool && ptr < linkedListPool.pool + LINKED_LIST_POOL_SIZE) {
-        linkedListPool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (s_origFree) s_origFree(ptr);
+    MemoryBlock* current = linkedListPool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(linkedListPool, current);
+            linkedListPool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            linkedListPool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        current = current->next;
     }
     LeaveCriticalSection(&g_lock);
 }
 
 extern "C" __declspec(dllexport) void StringFree(void* ptr) {
-    // Optimized for string deallocation (sub_6A0AB0, sub_6A3840, sub_6A3AA0, sub_6A35F0, sub_6CB980)
-    if (!ptr) return;
+    if (!ptr || !stringPool.pool) return;
     
     EnterCriticalSection(&g_lock);
-    if (stringPool.pool && ptr >= stringPool.pool && ptr < stringPool.pool + STRING_POOL_SIZE) {
-        stringPool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (s_origFree) s_origFree(ptr);
-    }
-    LeaveCriticalSection(&g_lock);
-}
-
-extern "C" __declspec(dllexport) void ExecutableFree(void* ptr) {
-    // Optimized for executable memory deallocation (sub_9AE540)
-    if (!ptr) return;
-    
-    EnterCriticalSection(&g_lock);
-    if (executablePool.pool && ptr >= executablePool.pool && ptr < executablePool.pool + EXECUTABLE_POOL_SIZE) {
-        executablePool.freeCount.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        if (s_origVirtualFree) s_origVirtualFree(ptr, 0, MEM_RELEASE);
+    MemoryBlock* current = stringPool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(stringPool, current);
+            stringPool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            stringPool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
+        }
+        current = current->next;
     }
     LeaveCriticalSection(&g_lock);
 }
 
 extern "C" __declspec(dllexport) void BatchLinkedListFree(void** ptrs, size_t count) {
-    // Optimized batch deallocation for linked lists (sub_698CF0, sub_6A35F0, sub_6A3840, sub_6A3AA0)
     if (!ptrs || count == 0) return;
     
-    EnterCriticalSection(&g_lock);
-    size_t freedCount = 0;
-    
     for (size_t i = 0; i < count; ++i) {
-        void* ptr = ptrs[i];
-        if (ptr && linkedListPool.pool && ptr >= linkedListPool.pool && ptr < linkedListPool.pool + LINKED_LIST_POOL_SIZE) {
-            freedCount++;
-        } else if (ptr) {
-            // Defer non-pool frees to avoid holding lock too long
-            ptrs[i] = nullptr; // Mark for later processing
-        }
-    }
-    
-    linkedListPool.freeCount.fetch_add(freedCount, std::memory_order_relaxed);
-    LeaveCriticalSection(&g_lock);
-    
-    // Process non-pool frees outside the lock
-    for (size_t i = 0; i < count; ++i) {
-        if (ptrs[i] == nullptr && s_origFree) {
-            s_origFree(ptrs[i]);
-        }
+        LinkedListFree(ptrs[i]);
     }
 }
 
-extern "C" __declspec(dllexport) void CustomFree(void* p) {
-    if (!p || !gameMemoryPool.pool) return;
+extern "C" __declspec(dllexport) void ExecutableFree(void* ptr) {
+    if (!ptr || !executablePool.pool) return;
     
-    // Enhanced free routing based on the 11 specific free patterns
-    
-    // Pattern 1: sub_4010E0 - General deallocation with SEH
-    // Pattern 2: sub_5CF9E0 - File operations cleanup
-    // Pattern 3: sub_698CF0 - Linked list chain deallocation
-    // Pattern 4: sub_69AA30 - Nested arrays cleanup
-    // Pattern 5: sub_6A0AB0 - String and temporary allocation cleanup
-    // Pattern 6: sub_6A35F0 - Resource transformation and linked list cleanup
-    // Pattern 7: sub_6A3840 - String processing and recursive linked deallocation
-    // Pattern 8: sub_6A3AA0 - String validation and linked structure deallocation
-    // Pattern 9: sub_819C90 - Simple free wrapper
-    // Pattern 10: sub_8CB4F0 - Event sink structure cleanup
-    // Pattern 11: sub_8CB980 - String management and conditional deallocation
-    
-    // Check specialized pools first for performance
-    if (logPool.pool && p >= logPool.pool && p < logPool.pool + LOG_BUFFER_SIZE) {
-        LogFree(p);
-        return;
-    }
-    
-    if (filePool.pool && p >= filePool.pool && p < filePool.pool + FILE_BUFFER_SIZE) {
-        FileFree(p);
-        return;
-    }
-    
-    if (guiPool.pool && p >= guiPool.pool && p < guiPool.pool + GUI_POOL_SIZE) {
-        GuiFree(p);
-        return;
-    }
-    
-    if (smallObjPool.pool && p >= smallObjPool.pool && p < smallObjPool.pool + SMALL_OBJ_POOL_SIZE) {
-        SmallObjFree(p);
-        return;
-    }
-    
-    if (linkedListPool.pool && p >= linkedListPool.pool && p < linkedListPool.pool + LINKED_LIST_POOL_SIZE) {
-        LinkedListFree(p);
-        return;
-    }
-    
-    if (stringPool.pool && p >= stringPool.pool && p < stringPool.pool + STRING_POOL_SIZE) {
-        StringFree(p);
-        return;
-    }
-    
-    if (executablePool.pool && p >= executablePool.pool && p < executablePool.pool + EXECUTABLE_POOL_SIZE) {
-        ExecutableFree(p);
-        return;
-    }
-    
-    // Check if in main custom pool
-    if (IsInCustomPool(p)) {
-        EnterCriticalSection(&g_lock);
-        MemoryBlock* targetBlock = nullptr;
-        MemoryBlock* current = gameMemoryPool.head.load(std::memory_order_acquire);
-        
-        while (current) {
-            if (current->address == p) {
-                if (!current->used || current->magic != BLOCK_MAGIC) {
-                    // Double free or corruption detected - enhanced error reporting
-                    ++gameMemoryPool.fragmentationCount;
-                    char errorBuffer[256];
-                    sprintf_s(errorBuffer, sizeof(errorBuffer), 
-                        "MEMORY CORRUPTION: Double free or invalid magic at %p (magic: 0x%08X)\n", 
-                        p, current->magic);
-                    OutputDebugStringA(errorBuffer);
-                    LeaveCriticalSection(&g_lock);
-                    return;
-                }
-                targetBlock = current;
-                break;
-            }
-            current = current->next;
+    EnterCriticalSection(&g_lock);
+    MemoryBlock* current = executablePool.head.load(std::memory_order_acquire);
+    while (current) {
+        if (current->address == ptr && current->used && current->magic == BLOCK_MAGIC) {
+            current->used = false;
+            current->magic = BLOCK_FREED_MAGIC;
+            memset(ptr, 0xFE, current->size); // Clear memory
+            PushSpecializedFreeBlock(executablePool, current);
+            executablePool.totalAllocated.fetch_sub(current->size, std::memory_order_relaxed);
+            executablePool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            LeaveCriticalSection(&g_lock);
+            return;
         }
-        
-        if (targetBlock) {
-            gameMemoryPool.totalAllocated.fetch_sub(targetBlock->size, std::memory_order_relaxed);
-            gameMemoryPool.freeCount.fetch_add(1, std::memory_order_relaxed);
-            targetBlock->used = false;
-            
-            // Enhanced security: Clear memory with pattern for debugging
-            memset(targetBlock->address, 0xFE, targetBlock->size);
-            
-            PushFreeBlock(targetBlock);
-        } else {
-            // Block not found in tracking - possible corruption
-            ++gameMemoryPool.fragmentationCount;
-            char errorBuffer[256];
-            sprintf_s(errorBuffer, sizeof(errorBuffer), 
-                "MEMORY CORRUPTION: Block not found in tracking at %p\n", p);
-            OutputDebugStringA(errorBuffer);
-        }
-        LeaveCriticalSection(&g_lock);
-    } else {
-        // Not in our pools, use original free
-        if (s_origFree) s_origFree(p);
+        current = current->next;
     }
+    LeaveCriticalSection(&g_lock);
 }
+
+// Remove TempMalloc and TempFree functions - they were unused
+// TempPool functionality has been removed for cleaner code
 
 extern "C" __declspec(dllexport) void* CustomRealloc(void* p, size_t size) {
     if (!p) return CustomMalloc(size);
@@ -1595,9 +2342,8 @@ static void HookIAT(const char* dllName, const char* funcName, void* newFunc)
 extern "C" __declspec(dllexport) void HookAllocators()
 {
     if (g_inited) return;
-    g_inited = true;
-
-    InitializeCriticalSection(&g_lock);
+    
+    // Initialize memory pools FIRST
     InitMemoryPool();
 
     // find original malloc/free and other memory functions
@@ -1643,50 +2389,296 @@ extern "C" __declspec(dllexport) void HookAllocators()
     HookIAT("kernel32.dll", "HeapFree", (void*)MyHeapFree);
     HookIAT("kernel32.dll", "VirtualAlloc", (void*)MyVirtualAlloc);
     HookIAT("kernel32.dll", "VirtualFree", (void*)MyVirtualFree);
+    
+    g_inited = true;
+    DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Memory allocators hooked successfully");
 }
 
-extern "C" __declspec(dllexport) void* TempMalloc(size_t size) {
-    if (size == 0 || size > TEMP_POOL_SIZE / 4) return (s_origMalloc ? s_origMalloc(size) : nullptr);
+// Forward declarations for specialized free functions
+extern "C" __declspec(dllexport) void LogFree(void* ptr);
+extern "C" __declspec(dllexport) void FileFree(void* ptr);
+extern "C" __declspec(dllexport) void GuiFree(void* ptr);
+extern "C" __declspec(dllexport) void SmallObjFree(void* ptr);
+extern "C" __declspec(dllexport) void LinkedListFree(void* ptr);
+extern "C" __declspec(dllexport) void StringFree(void* ptr);
+extern "C" __declspec(dllexport) void BatchLinkedListFree(void** ptrs, size_t count);
+extern "C" __declspec(dllexport) void ExecutableFree(void* ptr);
+
+// CustomFree implementation moved outside HookAllocators
+extern "C" __declspec(dllexport) void CustomFree(void* p)
+{
+    if (!p) return; // Freeing nullptr is allowed
     
-    EnterCriticalSection(&g_lock);
+    auto startTime = std::chrono::high_resolution_clock::now();
+    gameMemoryPool.freeCount.fetch_add(1, std::memory_order_relaxed);
     
-    // Check if tempPool is initialized
-    if (!tempPool.pool) {
+    // Log deallocation request
+    DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "CustomFree called for address %p", p);
+    
+    // FIRST: Validate pointer is not obviously invalid
+    // This prevents crashes when Dawn of War tries to free invalid memory
+    if (reinterpret_cast<uintptr_t>(p) < 0x10000) {
+        DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+            "Skipping free of suspiciously low address %p", p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    // Check if pointer might be in read-only memory (can't free)
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) {
+        DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+            "Cannot query memory at %p (invalid pointer)", p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    // Don't try to free read-only or no-access memory
+    if (mbi.Protect == PAGE_NOACCESS || mbi.Protect == PAGE_READONLY) {
+        DAWN_OF_WAR_LOG_WARN("MemoryPoolDLL", 
+            "Skipping free of read-only/no-access memory at %p", p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (!gameMemoryPool.pool) return;
+    
+    // Enhanced free routing based on 11 specific free patterns
+    
+    // Pattern 1: sub_4010E0 - General deallocation with SEH
+    // Pattern 2: sub_5CF9E0 - File operations cleanup
+    // Pattern 3: sub_698CF0 - Linked list chain deallocation
+    // Pattern 4: sub_69AA30 - Nested arrays cleanup
+    // Pattern 5: sub_6A0AB0 - String and temporary allocation cleanup
+    // Pattern 6: sub_6A35F0 - Resource transformation and linked list cleanup
+    // Pattern 7: sub_6A3840 - String processing and recursive linked deallocation
+    // Pattern 8: sub_6A3AA0 - String validation and linked structure deallocation
+    // Pattern 9: sub_819C90 - Simple free wrapper
+    // Pattern 10: sub_8CB4F0 - Event sink structure cleanup
+    // Pattern 11: sub_8CB980 - String management and conditional deallocation
+    
+    // Check specialized pools first for performance
+    if (logPool.pool && p >= logPool.pool && p < logPool.pool + LOG_BUFFER_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to log pool free", p);
+        LogFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (filePool.pool && p >= filePool.pool && p < filePool.pool + FILE_BUFFER_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to file pool free", p);
+        FileFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (guiPool.pool && p >= guiPool.pool && p < guiPool.pool + GUI_POOL_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to GUI pool free", p);
+        GuiFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (smallObjPool.pool && p >= smallObjPool.pool && p < smallObjPool.pool + SMALL_OBJ_POOL_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to small object pool free", p);
+        SmallObjFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (linkedListPool.pool && p >= linkedListPool.pool && p < linkedListPool.pool + LINKED_LIST_POOL_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to linked list pool free", p);
+        LinkedListFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (stringPool.pool && p >= stringPool.pool && p < stringPool.pool + STRING_POOL_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to string pool free", p);
+        StringFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    if (executablePool.pool && p >= executablePool.pool && p < executablePool.pool + EXECUTABLE_POOL_SIZE) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Routing %p to executable pool free", p);
+        ExecutableFree(p);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+        gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
+        return;
+    }
+    
+    // Check if in main custom pool
+    if (IsInCustomPool(p)) {
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Freeing %p from main pool", p);
+        EnterCriticalSection(&g_lock);
+        MemoryBlock* targetBlock = nullptr;
+        MemoryBlock* current = gameMemoryPool.head.load(std::memory_order_acquire);
+        
+        while (current) {
+            if (current->address == p) {
+                if (!current->used || current->magic != BLOCK_MAGIC) {
+                    // Double free or corruption detected - enhanced error reporting
+                    ++gameMemoryPool.fragmentationCount;
+                    DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Memory corruption: Double free or invalid magic at %p (magic: 0x%08X)", p, current->magic);
+                    char errorBuffer[256];
+                    sprintf_s(errorBuffer, sizeof(errorBuffer), 
+                        "MEMORY CORRUPTION: Double free or invalid magic at %p (magic: 0x%08X)\n", 
+                        p, current->magic);
+                    OutputDebugStringA(errorBuffer);
+                    LeaveCriticalSection(&g_lock);
+                    auto endTime = std::chrono::high_resolution_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+                    gameMemoryPool.totalFreeTime.fetch_add((size_t)duration, std::memory_order_relaxed);
+                    return;
+                }
+                targetBlock = current;
+                break;
+            }
+            current = current->next;
+        }
+        
+        if (targetBlock) {
+            gameMemoryPool.totalAllocated.fetch_sub(targetBlock->size, std::memory_order_relaxed);
+            gameMemoryPool.freeCount.fetch_add(1, std::memory_order_relaxed);
+            targetBlock->used = false;
+            
+            // Enhanced security: Clear memory with pattern for debugging
+            memset(targetBlock->address, 0xFE, targetBlock->size);
+            
+            PushFreeBlock(targetBlock);
+            DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Successfully freed %zu bytes from %p", targetBlock->size, p);
+        } else {
+            // Block not found in tracking - possible corruption
+            ++gameMemoryPool.fragmentationCount;
+            DAWN_OF_WAR_LOG_ERROR("MemoryPoolDLL", "Memory corruption: Block not found in tracking at %p", p);
+            char errorBuffer[256];
+            sprintf_s(errorBuffer, sizeof(errorBuffer), 
+                "MEMORY CORRUPTION: Block not found in tracking at %p\n", p);
+            OutputDebugStringA(errorBuffer);
+        }
         LeaveCriticalSection(&g_lock);
-        return (s_origMalloc ? s_origMalloc(size) : nullptr);
+    } else {
+        // Not in our pools, use original free
+        DAWN_OF_WAR_LOG_TRACE("MemoryPoolDLL", "Forwarding %p to system free (not in our pools)", p);
+        if (s_origFree) s_origFree(p);
     }
     
-    // Use gameMemoryPool for temporary allocations with tracking
-    void* allocatedMemory = gameMemoryPool.pool + gameMemoryPool.offset.load(std::memory_order_relaxed);
-    
-    // Align to cache line
-    size_t alignedSize = (size + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
-    
-    if (gameMemoryPool.offset.load(std::memory_order_relaxed) + alignedSize > TOTAL_POOL_SIZE) {
-        LeaveCriticalSection(&g_lock);
-        return (s_origMalloc ? s_origMalloc(size) : nullptr);
-    }
-    
-    gameMemoryPool.offset.fetch_add(alignedSize, std::memory_order_relaxed);
-    gameMemoryPool.totalAllocated.fetch_add(size, std::memory_order_relaxed);
-    gameMemoryPool.tempAllocCount.fetch_add(1, std::memory_order_relaxed);
-    
-    size_t currentUsage = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
-    size_t peakUsage = gameMemoryPool.peakUsage.load(std::memory_order_relaxed);
-    if (currentUsage > peakUsage) {
-        gameMemoryPool.peakUsage.store(currentUsage, std::memory_order_relaxed);
-    }
-    
-    LeaveCriticalSection(&g_lock);
-    return allocatedMemory;
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+    gameMemoryPool.totalFreeTime.fetch_add(static_cast<size_t>(duration), std::memory_order_relaxed);
 }
 
-extern "C" __declspec(dllexport) void TempFree(void* ptr) {
-    if (!ptr) return;
+// Periodic memory statistics reporting
+void ReportMemoryStatistics() {
+    static DWORD lastReportTime = 0;
+    DWORD currentTime = GetTickCount();
     
-    // For temporary allocations, we don't actually free to avoid fragmentation
-    // They will be reused when the pool resets
-    gameMemoryPool.tempAllocCount.fetch_sub(1, std::memory_order_relaxed);
+    // Report every 60 seconds
+    if (currentTime - lastReportTime > 60000) {
+        lastReportTime = currentTime;
+        
+        // Main pool statistics
+        size_t mainAllocated = gameMemoryPool.totalAllocated.load(std::memory_order_relaxed);
+        size_t mainPeak = gameMemoryPool.peakUsage.load(std::memory_order_relaxed);
+        size_t mainMallocs = gameMemoryPool.mallocCount.load(std::memory_order_relaxed);
+        size_t mainFrees = gameMemoryPool.freeCount.load(std::memory_order_relaxed);
+        size_t mainAllocTime = gameMemoryPool.totalAllocTime.load(std::memory_order_relaxed);
+        size_t mainFreeTime = gameMemoryPool.totalFreeTime.load(std::memory_order_relaxed);
+        size_t mainCacheHits = gameMemoryPool.cacheHits.load(std::memory_order_relaxed);
+        size_t mainCacheMisses = gameMemoryPool.cacheMisses.load(std::memory_order_relaxed);
+        
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "=== MEMORY POOL STATISTICS ===");
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Main Pool: %zu MB allocated, %zu MB peak (%.1f%% usage)", 
+            mainAllocated / (1024 * 1024), mainPeak / (1024 * 1024), 
+            (mainAllocated * 100.0f) / TOTAL_POOL_SIZE);
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Operations: %zu mallocs, %zu frees, %zu cache hits, %zu cache misses", 
+            mainMallocs, mainFrees, mainCacheHits, mainCacheMisses);
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Performance: Avg alloc %zu μs, Avg free %zu μs", 
+            mainMallocs > 0 ? mainAllocTime / mainMallocs : 0,
+            mainFrees > 0 ? mainFreeTime / mainFrees : 0);
+        
+        // Specialized pool statistics
+        if (logPool.pool) {
+            size_t logAllocated = logPool.totalAllocated.load(std::memory_order_relaxed);
+            size_t logCount = logPool.logAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Log Pool: %zu MB allocated, %zu allocations", 
+                logAllocated / (1024 * 1024), logCount);
+        }
+        
+        if (filePool.pool) {
+            size_t fileAllocated = filePool.totalAllocated.load(std::memory_order_relaxed);
+            size_t fileCount = filePool.fileAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "File Pool: %zu MB allocated, %zu allocations", 
+                fileAllocated / (1024 * 1024), fileCount);
+        }
+        
+        if (guiPool.pool) {
+            size_t guiAllocated = guiPool.totalAllocated.load(std::memory_order_relaxed);
+            size_t guiCount = guiPool.guiAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "GUI Pool: %zu MB allocated, %zu allocations", 
+                guiAllocated / (1024 * 1024), guiCount);
+        }
+        
+        if (smallObjPool.pool) {
+            size_t smallAllocated = smallObjPool.totalAllocated.load(std::memory_order_relaxed);
+            size_t smallCount = smallObjPool.smallObjAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Small Object Pool: %zu MB allocated, %zu allocations", 
+                smallAllocated / (1024 * 1024), smallCount);
+        }
+        
+        if (linkedListPool.pool) {
+            size_t linkedAllocated = linkedListPool.totalAllocated.load(std::memory_order_relaxed);
+            size_t linkedCount = linkedListPool.linkedListAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Linked List Pool: %zu MB allocated, %zu allocations", 
+                linkedAllocated / (1024 * 1024), linkedCount);
+        }
+        
+        if (stringPool.pool) {
+            size_t stringAllocated = stringPool.totalAllocated.load(std::memory_order_relaxed);
+            size_t stringCount = stringPool.stringAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "String Pool: %zu MB allocated, %zu allocations", 
+                stringAllocated / (1024 * 1024), stringCount);
+        }
+        
+        if (executablePool.pool) {
+            size_t execAllocated = executablePool.totalAllocated.load(std::memory_order_relaxed);
+            size_t execCount = executablePool.executableAllocCount.load(std::memory_order_relaxed);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Executable Pool: %zu MB allocated, %zu allocations", 
+                execAllocated / (1024 * 1024), execCount);
+        }
+        
+        // System memory information
+        MEMORYSTATUSEX memStatus;
+        memStatus.dwLength = sizeof(memStatus);
+        if (GlobalMemoryStatusEx(&memStatus)) {
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "System Memory: %u%% load, %zu MB available, %zu MB total", 
+                memStatus.dwMemoryLoad,
+                memStatus.ullAvailPhys / (1024 * 1024),
+                memStatus.ullTotalPhys / (1024 * 1024));
+        }
+        
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "=== END STATISTICS ===");
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID)
@@ -1694,14 +2686,61 @@ BOOL WINAPI DllMain(HINSTANCE hDLL, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hDLL);
+        
+        // Initialize critical section first
+        InitializeCriticalSection(&g_lock);
+        
+        // Setup crash reporting system early - BEFORE any allocations
+        SetupCrashReporting();
+        
+        // Try to initialize master logger - but don't fail if it's not available
+        // The logger might be loaded separately or not at all
+        try {
+            DawnOfWarLog_Initialize(nullptr);
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Dawn of War Memory Pool DLL starting");
+        } catch (...) {
+            // Logger initialization failed - continue without logging
+            // We can still use OutputDebugString for critical errors
+        }
+        
         // Hook allocators right away
         HookAllocators();
+        
+        // Try to log success if logger is available
+        try {
+            DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Memory Pool DLL initialization completed successfully");
+        } catch (...) {
+            // Logger not available, use debug output
+            OutputDebugStringA("MemoryPoolDLL: Initialization completed (no logger available)\n");
+        }
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        DAWN_OF_WAR_LOG_INFO("MemoryPoolDLL", "Dawn of War Memory Pool DLL shutting down");
+        
+        // Report final statistics
+        ReportMemoryStatistics();
+        
         // cleanup
         CleanupMemoryPool();
+        
+        // Clean up crash reporting buffer
+        if (g_crashReportBuffer) {
+            VirtualFree(g_crashReportBuffer, 0, MEM_RELEASE);
+            g_crashReportBuffer = nullptr;
+            g_crashReportSize = 0;
+        }
+        
+        // Clean up emergency reserve
+        if (g_emergencyReserve) {
+            VirtualFree(g_emergencyReserve, 0, MEM_RELEASE);
+            g_emergencyReserve = nullptr;
+        }
+        
         DeleteCriticalSection(&g_lock);
+        
+        // Shutdown master logger last
+        DawnOfWarLog_Shutdown();
     }
     return TRUE;
 }

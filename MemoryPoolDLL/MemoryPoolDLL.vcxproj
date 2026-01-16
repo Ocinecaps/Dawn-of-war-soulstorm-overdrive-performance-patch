@@ -76,13 +76,23 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
-    <OutDir>..\Output\</OutDir>
-    <IntDir>$(ProjectDir)\Debug\</IntDir>
+    <OutDir>$(SolutionDir)Output\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
     <TargetName>DawnOfWarMemoryPoolDLL</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <OutDir>..\Output\</OutDir>
-    <IntDir>$(ProjectDir)\Release\</IntDir>
+    <OutDir>$(SolutionDir)Output\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>DawnOfWarMemoryPoolDLL</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(SolutionDir)Output\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>DawnOfWarMemoryPoolDLL</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(SolutionDir)Output\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
     <TargetName>DawnOfWarMemoryPoolDLL</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -93,12 +103,14 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>../MasterLoggerDLL/include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;$(SolutionDir)Output\DawnOfWarLogger.lib;</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -112,6 +124,7 @@
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <CompileAs>CompileAsCpp</CompileAs>
+      <AdditionalIncludeDirectories>../MasterLoggerDLL/include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -119,7 +132,8 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;$(SolutionDir)Output\DawnOfWarLogger.lib;</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -130,12 +144,14 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>../MasterLoggerDLL/include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;$(SolutionDir)Output\DawnOfWarLogger.lib;</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -148,6 +164,7 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>../MasterLoggerDLL/include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -155,7 +172,8 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;</AdditionalDependencies>
+      <AdditionalDependencies>User32.lib;Imagehlp.lib;gdi32.lib;$(SolutionDir)Output\DawnOfWarLogger.lib;</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)Output;</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

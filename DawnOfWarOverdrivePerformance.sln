@@ -3,11 +3,11 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 18.3.11408.92 d18.3
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DawnOfWarMemoryPoolDLL", "MemoryPoolDLL\MemoryPoolDLL.vcxproj", "{ADE1A11A-02DD-4F79-8971-0F60FB1371A7}"
+	ProjectSection(ProjectDependencies) = postProject
+		{B2C3D4E5-F6A7-8901-BCDE-234567890ABC} = {B2C3D4E5-F6A7-8901-BCDE-234567890ABC}
+	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DawnOfWarSoulstormPatcher", "Redone\Redone.vcxproj", "{4D008A5A-E8D1-4490-83A0-77042B781159}"
-	ProjectSection(ProjectDependencies) = postProject
-		{ADE1A11A-02DD-4F79-8971-0F60FB1371A7} = {ADE1A11A-02DD-4F79-8971-0F60FB1371A7}
-	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DawnOfWarLoggerDLL", "MasterLoggerDLL\MasterLogger.vcxproj", "{B2C3D4E5-F6A7-8901-BCDE-234567890ABC}"
 EndProject

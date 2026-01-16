@@ -19,6 +19,22 @@ DawnOfWarLoggerState g_dawnOfWarLogger = {0};
 DawnOfWarModuleLevel* g_dawnOfWarModuleLevels = NULL;
 CRITICAL_SECTION g_dawnOfWarModuleLevelsCs;
 
+// LAA State Tracking Structure
+struct LAAStateLog {
+    bool isLAAEnabled;
+    bool is64BitOS;
+    size_t totalPhysicalMemory;
+    size_t availablePhysicalMemory;
+    size_t usableAddressSpace;
+    DWORD_PTR processImageBase;
+    time_t timestamp;
+    char executablePath[MAX_PATH];
+};
+
+static LAAStateLog g_lastLAAState = {};
+static bool g_laaStateInitialized = false;
+static CRITICAL_SECTION g_logCriticalSection = {};
+
 // Forward declarations
 static DWORD WINAPI WorkerThread(LPVOID param);
 static void ProcessLogEntry(const DawnOfWarLogEntry* entry);
@@ -66,6 +82,8 @@ void DawnOfWarLog_Initialize(const char* configPath) {
     InitializeCriticalSection(&g_dawnOfWarLogger.statsCs);
     InitializeCriticalSection(&g_dawnOfWarModuleLevelsCs);
     InitializeCriticalSection(&g_dawnOfWarLogger.ringBuffer.cs);
+    InitializeCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    InitializeCriticalSection(&g_logCriticalSection);
 
     // Set default configuration
     g_dawnOfWarLogger.config.globalLevel = DAWN_OF_WAR_LOG_INFO;
@@ -77,6 +95,20 @@ void DawnOfWarLog_Initialize(const char* configPath) {
     g_dawnOfWarLogger.config.bufferSize = 1024;
     g_dawnOfWarLogger.config.enableColors = TRUE;
     g_dawnOfWarLogger.config.enableStackTrace = TRUE;
+
+    // Initialize enhanced console settings
+    g_dawnOfWarLogger.enhancedConsoleEnabled = TRUE;
+    g_dawnOfWarLogger.consoleUpdateInterval = 1000; // Update every 1 second
+    QueryPerformanceCounter(&g_dawnOfWarLogger.lastConsoleUpdate);
+
+    // Initialize performance statistics
+    ZeroMemory(&g_dawnOfWarLogger.stats, sizeof(DawnOfWarLoggerStats));
+    QueryPerformanceCounter(&g_dawnOfWarLogger.stats.startupTime);
+    g_dawnOfWarLogger.stats.totalSessions = 1;
+
+    // Initialize memory statistics
+    ZeroMemory(&g_dawnOfWarLogger.memoryStats, sizeof(DawnOfWarMemoryStats));
+    g_dawnOfWarLogger.memoryStats.smallestAllocation = SIZE_MAX;
 
     // Load configuration
     if (configPath) {
@@ -92,22 +124,173 @@ void DawnOfWarLog_Initialize(const char* configPath) {
     g_dawnOfWarLogger.ringBuffer.tail = 0;
     g_dawnOfWarLogger.ringBuffer.count = 0;
 
-    // Create log directory if it doesn't exist
-    CreateDirectoryA(g_dawnOfWarLogger.config.logPath, NULL);
-
-    // Open log file
-    char logFileName[MAX_PATH];
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    sprintf_s(logFileName, sizeof(logFileName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d.log",
-        g_dawnOfWarLogger.config.logPath, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    
-    g_dawnOfWarLogger.logFile = CreateFileA(logFileName, GENERIC_WRITE, FILE_SHARE_READ,
-        NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-
-    // Initialize console if enabled
+    // Initialize console FIRST - so we can show errors
     if (g_dawnOfWarLogger.config.outputs & DAWN_OF_WAR_OUTPUT_CONSOLE) {
         InitializeConsole();
+    }
+
+    // Single log file for technical details - consistent naming
+    char logFileName[MAX_PATH];
+    char logPath[MAX_PATH];
+    
+    // Try multiple paths for log directory creation
+    bool logFileCreated = false;
+    DWORD logPathAttempts = 0;
+    
+    // Attempt 1: Use configured path (typically "logs")
+    strcpy_s(logPath, sizeof(logPath), g_dawnOfWarLogger.config.logPath);
+    
+    while (!logFileCreated && logPathAttempts < 4) {
+        // Use consistent single log file name for technical details
+        sprintf_s(logFileName, sizeof(logFileName), "%s\\DawnOfWar_Technical.log", logPath);
+        
+        // Create directory with enhanced error handling
+        if (logPathAttempts > 0) {
+            // For fallback attempts, create directory more aggressively
+            char fullPath[MAX_PATH];
+            strcpy_s(fullPath, sizeof(fullPath), logPath);
+            
+            // Create directory recursively
+            char* p = fullPath;
+            while (*p) {
+                if (*p == '\\' || *p == '/') {
+                    char temp = *p;
+                    *p = '\0';
+                    CreateDirectoryA(fullPath, NULL);
+                    *p = temp;
+                }
+                p++;
+            }
+            CreateDirectoryA(fullPath, NULL);
+        }
+        
+        g_dawnOfWarLogger.logFile = CreateFileA(logFileName, GENERIC_WRITE, FILE_SHARE_READ,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        
+        if (g_dawnOfWarLogger.logFile != INVALID_HANDLE_VALUE) {
+            logFileCreated = true;
+            strcpy_s(g_dawnOfWarLogger.config.logPath, sizeof(g_dawnOfWarLogger.config.logPath), logPath);
+            
+            // Move to end of file for appending
+            SetFilePointer(g_dawnOfWarLogger.logFile, 0, NULL, FILE_END);
+            
+            // Report success to console immediately
+            if (g_dawnOfWarLogger.consoleHandle) {
+                char successMsg[512];
+                sprintf_s(successMsg, sizeof(successMsg), "SUCCESS: Technical log file opened for appending: %s\n", logFileName);
+                DWORD bytesWritten;
+                WriteConsoleA(g_dawnOfWarLogger.consoleHandle, successMsg, (DWORD)strlen(successMsg), &bytesWritten, NULL);
+            }
+            break;
+        } else {
+            // Report specific error for this attempt
+            DWORD error = GetLastError();
+            if (g_dawnOfWarLogger.consoleHandle) {
+                char errorMsg[512];
+                sprintf_s(errorMsg, sizeof(errorMsg), "FAILED to open technical log file '%s' (attempt %d). Error: %lu\n", 
+                    logFileName, logPathAttempts + 1, error);
+                DWORD bytesWritten;
+                WriteConsoleA(g_dawnOfWarLogger.consoleHandle, errorMsg, (DWORD)strlen(errorMsg), &bytesWritten, NULL);
+            }
+        }
+        
+        // Fallback attempts with different paths
+        logPathAttempts++;
+        switch (logPathAttempts) {
+        case 1:
+            // Try current directory
+            strcpy_s(logPath, sizeof(logPath), ".");
+            break;
+        case 2:
+            // Try temp directory
+            GetTempPathA(sizeof(logPath), logPath);
+            strcat_s(logPath, sizeof(logPath), "DawnOfWarLogs");
+            break;
+        case 3:
+            // Try desktop
+            if (SHGetFolderPathA(NULL, CSIDL_DESKTOP, NULL, SHGFP_TYPE_CURRENT, logPath) != S_OK) {
+                strcpy_s(logPath, sizeof(logPath), "C:\\");
+            }
+            strcat_s(logPath, sizeof(logPath), "DawnOfWarLogs");
+            break;
+        }
+    }
+    
+    // Final status report
+    if (!logFileCreated) {
+        if (g_dawnOfWarLogger.consoleHandle) {
+            char finalError[512];
+            sprintf_s(finalError, sizeof(finalError), 
+                "CRITICAL: All log file creation attempts failed! Logging will be console-only.\n"
+                "Attempted paths:\n"
+                "1. %s\\DawnOfWar_Technical.log\n"
+                "2. .\\DawnOfWar_Technical.log\n"
+                "3. <temp>\\DawnOfWarLogs\\DawnOfWar_Technical.log\n"
+                "4. <desktop>\\DawnOfWarLogs\\DawnOfWar_Technical.log\n",
+                g_dawnOfWarLogger.config.logPath);
+            DWORD bytesWritten;
+            WriteConsoleA(g_dawnOfWarLogger.consoleHandle, finalError, (DWORD)strlen(finalError), &bytesWritten, NULL);
+        }
+        
+        // Force file output to be disabled since we couldn't create a file
+        g_dawnOfWarLogger.config.outputs &= ~DAWN_OF_WAR_OUTPUT_FILE;
+    }
+    
+    // Write log header if file is valid
+    if (g_dawnOfWarLogger.logFile != INVALID_HANDLE_VALUE) {
+        char header[1024];
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        
+        // Check if file is empty to decide whether to write header
+        DWORD fileSize = GetFileSize(g_dawnOfWarLogger.logFile, NULL);
+        
+        if (fileSize == 0) {
+            // New file - write header
+            sprintf_s(header, sizeof(header), 
+                "=== Dawn of War Soulstorm - Technical Log File ===\n"
+                "This file contains detailed technical information about patching and memory management\n"
+                "Session Start: %04d-%02d-%02d %02d:%02d:%02d\n"
+                "Process ID: %lu\n"
+                "Logger Version: 2.0 Enhanced\n"
+                "================================================\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                GetCurrentProcessId());
+        } else {
+            // Existing file - append session separator
+            sprintf_s(header, sizeof(header), 
+                "\n=== NEW SESSION ===\n"
+                "Session Start: %04d-%02d-%02d %02d:%02d:%02d\n"
+                "Process ID: %lu\n"
+                "-------------------\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                GetCurrentProcessId());
+        }
+        
+        DWORD bytesWritten;
+        WriteFile(g_dawnOfWarLogger.logFile, header, (DWORD)strlen(header), &bytesWritten, NULL);
+        g_dawnOfWarLogger.stats.bytesWritten += bytesWritten;
+        FlushFileBuffers(g_dawnOfWarLogger.logFile);
+        
+        // Also write success to console
+        if (g_dawnOfWarLogger.consoleHandle) {
+            char successMsg[256];
+            sprintf_s(successMsg, sizeof(successMsg), "Log file created: %s\n", logFileName);
+            WriteConsoleA(g_dawnOfWarLogger.consoleHandle, successMsg, (DWORD)strlen(successMsg), &bytesWritten, NULL);
+        }
+        
+        // IMMEDIATE TEST: Write a test message directly to file to verify it works
+        const char* testMsg = "=== IMMEDIATE FILE WRITE TEST ===\nIf you see this, file writing is working!\n";
+        WriteFile(g_dawnOfWarLogger.logFile, testMsg, (DWORD)strlen(testMsg), &bytesWritten, NULL);
+        FlushFileBuffers(g_dawnOfWarLogger.logFile);
+    } else {
+        // File creation failed, but we have console - report it
+        if (g_dawnOfWarLogger.consoleHandle) {
+            char errorMsg[256];
+            sprintf_s(errorMsg, sizeof(errorMsg), "WARNING: Log file creation failed, using console only\n");
+            DWORD bytesWritten;
+            WriteConsoleA(g_dawnOfWarLogger.consoleHandle, errorMsg, (DWORD)strlen(errorMsg), &bytesWritten, NULL);
+        }
     }
 
     // Create synchronization objects
@@ -126,10 +309,48 @@ void DawnOfWarLog_Initialize(const char* configPath) {
     QueryPerformanceFrequency(&g_dawnOfWarLogger.performanceFrequency);
     QueryPerformanceCounter(&g_dawnOfWarLogger.lastStatsTime);
 
+    // Mark as initialized
     g_dawnOfWarLogger.initialized = TRUE;
+    
+    // Write test message to verify logger is working
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_INFO, "DawnOfWarLogger", 
+        "Logger successfully initialized! Console: %s, File: %s, Outputs: %lu",
+        g_dawnOfWarLogger.consoleHandle ? "YES" : "NO",
+        g_dawnOfWarLogger.logFile != INVALID_HANDLE_VALUE ? "YES" : "NO",
+        g_dawnOfWarLogger.config.outputs);
+    
+    // Flush immediately to show the test message
+    DawnOfWarLog_Flush();
 
     // Log initialization
     DawnOfWarLog_Write(DAWN_OF_WAR_LOG_INFO, "DawnOfWarLogger", "Dawn of War Logger initialized successfully");
+    
+    // Test logging functionality across all levels
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_DEBUG, "DawnOfWarLogger", "Testing DEBUG level logging");
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_INFO, "DawnOfWarLogger", "Testing INFO level logging");
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_WARN, "DawnOfWarLogger", "Testing WARN level logging");
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_ERROR, "DawnOfWarLogger", "Testing ERROR level logging");
+    
+    // Test module-specific logging
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_INFO, "MemoryPoolDLL", "Memory pool logger integration test");
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_INFO, "Patcher", "Patcher logger integration test");
+    
+    // DIRECT FILE WRITE TEST: Bypass worker thread
+    if (g_dawnOfWarLogger.logFile != INVALID_HANDLE_VALUE) {
+        const char* directTest = "=== DIRECT FILE WRITE TEST (bypassing worker thread) ===\nThis proves the file handle is valid and writable!\n";
+        DWORD bytesWritten;
+        WriteFile(g_dawnOfWarLogger.logFile, directTest, (DWORD)strlen(directTest), &bytesWritten, NULL);
+        FlushFileBuffers(g_dawnOfWarLogger.logFile);
+        
+        if (g_dawnOfWarLogger.consoleHandle) {
+            char consoleMsg[256];
+            sprintf_s(consoleMsg, sizeof(consoleMsg), "DIRECT TEST: Wrote %lu bytes directly to log file\n", bytesWritten);
+            WriteConsoleA(g_dawnOfWarLogger.consoleHandle, consoleMsg, (DWORD)strlen(consoleMsg), &bytesWritten, NULL);
+        }
+    }
+    
+    // Flush to ensure everything is written
+    DawnOfWarLog_Flush();
 }
 
 // Shutdown Dawn of War logger system
@@ -193,6 +414,7 @@ void DawnOfWarLog_Shutdown(void) {
     DeleteCriticalSection(&g_dawnOfWarLogger.statsCs);
     DeleteCriticalSection(&g_dawnOfWarModuleLevelsCs);
     DeleteCriticalSection(&g_dawnOfWarLogger.ringBuffer.cs);
+    DeleteCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
 
     g_dawnOfWarLogger.initialized = FALSE;
 }
@@ -282,7 +504,7 @@ void DawnOfWarLog_WriteVA(DawnOfWarLogLevel level, const char* module, const cha
 }
 
 // Write Dawn of War hex dump
-void DawnOfWarLog_HexDump(DawnOfWarLogLevel level, const char* module, const void* data, size_t size) {
+void DawnOfWarLog_HexDump(DawnOfWarLogLevel level, const char* module, const unsigned char* data, size_t size) {
     if (!g_dawnOfWarLogger.initialized || !module || !data || size == 0) return;
     
     if (!ShouldLog(level, module)) return;
@@ -431,41 +653,91 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
     return 0;
 }
 
-// Write Dawn of War entry to file
-static void WriteToFile(const DawnOfWarLogEntry* entry) {
-    if (g_dawnOfWarLogger.logFile == INVALID_HANDLE_VALUE) return;
+// Enhanced console writing with performance tracking
+static void WriteToConsole(const DawnOfWarLogEntry* entry) {
+    if (!g_dawnOfWarLogger.consoleHandle) {
+        return;
+    }
 
-    char formatted[4096];
-    FormatLogMessage(entry, formatted, sizeof(formatted));
+    char formattedMessage[2048];
+    FormatLogMessage(entry, formattedMessage, sizeof(formattedMessage));
+    
+    // Add newline for proper console formatting
+    strcat_s(formattedMessage, sizeof(formattedMessage), "\n");
+    
+    if (g_dawnOfWarLogger.config.enableColors) {
+        WORD color = GetConsoleColor(entry->level);
+        SetConsoleTextAttribute(g_dawnOfWarLogger.consoleHandle, color);
+    }
     
     DWORD bytesWritten;
-    WriteFile(g_dawnOfWarLogger.logFile, formatted, (DWORD)strlen(formatted), &bytesWritten, NULL);
-    WriteFile(g_dawnOfWarLogger.logFile, "\r\n", 2, &bytesWritten, NULL);
-
-    // Check file size and rotate if necessary
-    LARGE_INTEGER fileSize;
-    GetFileSizeEx(g_dawnOfWarLogger.logFile, &fileSize);
+    WriteConsoleA(g_dawnOfWarLogger.consoleHandle, formattedMessage, 
+                  (DWORD)strlen(formattedMessage), &bytesWritten, NULL);
     
-    if (fileSize.QuadPart > (LONGLONG)(g_dawnOfWarLogger.config.maxFileSizeMB * 1024 * 1024)) {
-        RotateLogFile();
+    if (g_dawnOfWarLogger.config.enableColors) {
+        SetConsoleTextAttribute(g_dawnOfWarLogger.consoleHandle, 
+                               g_dawnOfWarLogger.defaultConsoleAttributes);
+    }
+    
+    // Update enhanced console display if enabled
+    if (g_dawnOfWarLogger.enhancedConsoleEnabled) {
+        LARGE_INTEGER currentTime;
+        QueryPerformanceCounter(&currentTime);
+        
+        LONGLONG elapsedMs = (currentTime.QuadPart - g_dawnOfWarLogger.lastConsoleUpdate.QuadPart) * 1000 / 
+                            g_dawnOfWarLogger.performanceFrequency.QuadPart;
+        
+        if (elapsedMs >= g_dawnOfWarLogger.consoleUpdateInterval) {
+            DawnOfWarLog_UpdateConsoleDisplay();
+            g_dawnOfWarLogger.lastConsoleUpdate = currentTime;
+        }
     }
 }
 
-// Write Dawn of War entry to console
-static void WriteToConsole(const DawnOfWarLogEntry* entry) {
-    if (!g_dawnOfWarLogger.consoleHandle) return;
-
-    char formatted[4096];
-    FormatLogMessage(entry, formatted, sizeof(formatted));
-    
-    if (g_dawnOfWarLogger.config.enableColors) {
-        SetConsoleTextAttribute(g_dawnOfWarLogger.consoleHandle, GetConsoleColor(entry->level));
+// Enhanced file writing with consistent error handling and statistics
+static void WriteToFile(const DawnOfWarLogEntry* entry) {
+    if (g_dawnOfWarLogger.logFile == INVALID_HANDLE_VALUE) {
+        return;
     }
+
+    char formattedMessage[2048];
+    FormatLogMessage(entry, formattedMessage, sizeof(formattedMessage));
     
-    printf("%s\n", formatted);
+    // Add newline for proper file formatting
+    strcat_s(formattedMessage, sizeof(formattedMessage), "\n");
     
-    if (g_dawnOfWarLogger.config.enableColors) {
-        SetConsoleTextAttribute(g_dawnOfWarLogger.consoleHandle, g_dawnOfWarLogger.defaultConsoleAttributes);
+    DWORD bytesWritten;
+    BOOL success = WriteFile(g_dawnOfWarLogger.logFile, formattedMessage, 
+                            (DWORD)strlen(formattedMessage), &bytesWritten, NULL);
+    
+    if (success && bytesWritten > 0) {
+        EnterCriticalSection(&g_dawnOfWarLogger.statsCs);
+        g_dawnOfWarLogger.stats.bytesWritten += bytesWritten;
+        LeaveCriticalSection(&g_dawnOfWarLogger.statsCs);
+        
+        // Check for log rotation
+        LARGE_INTEGER fileSize;
+        if (GetFileSizeEx(g_dawnOfWarLogger.logFile, &fileSize)) {
+            size_t sizeMB = (size_t)(fileSize.QuadPart / (1024 * 1024));
+            if (sizeMB >= g_dawnOfWarLogger.config.maxFileSizeMB) {
+                RotateLogFile();
+                EnterCriticalSection(&g_dawnOfWarLogger.statsCs);
+                g_dawnOfWarLogger.stats.logRotations++;
+                LeaveCriticalSection(&g_dawnOfWarLogger.statsCs);
+            }
+        }
+    } else {
+        // Handle write failure - avoid recursion by not calling DawnOfWarLog_Write
+        DWORD error = GetLastError();
+        // Write directly to console for critical file errors
+        if (g_dawnOfWarLogger.consoleHandle) {
+            char errorMsg[256];
+            sprintf_s(errorMsg, sizeof(errorMsg), 
+                "[LOGGER ERROR] Failed to write to log file. Error: %lu\n", error);
+            DWORD bytesWritten;
+            WriteConsoleA(g_dawnOfWarLogger.consoleHandle, errorMsg, 
+                          (DWORD)strlen(errorMsg), &bytesWritten, NULL);
+        }
     }
 }
 
@@ -481,12 +753,42 @@ static void WriteToNetwork(const DawnOfWarLogEntry* entry) {
     
     // TODO: Implement Dawn of War network logging
     // This would send log entry to a remote server via UDP/TCP
+    // For now, just write to console that network logging is not implemented
+    if (g_dawnOfWarLogger.consoleHandle) {
+        char networkMsg[512];
+        sprintf_s(networkMsg, sizeof(networkMsg), 
+            "[NETWORK] Network logging not implemented for: [%s] %s\n", 
+            entry->module, entry->message);
+        DWORD bytesWritten;
+        WriteConsoleA(g_dawnOfWarLogger.consoleHandle, networkMsg, 
+                      (DWORD)strlen(networkMsg), &bytesWritten, NULL);
+    }
 }
+
 
 // Process Dawn of War log entry (route to appropriate outputs)
 static void ProcessLogEntry(const DawnOfWarLogEntry* entry) {
     if (!entry) return;
     
+    // Update performance statistics
+    EnterCriticalSection(&g_dawnOfWarLogger.statsCs);
+    g_dawnOfWarLogger.stats.messagesLogged++;
+    g_dawnOfWarLogger.totalMessages++;
+    
+    // Track error and warning counts
+    if (entry->level >= DAWN_OF_WAR_LOG_ERROR) {
+        g_dawnOfWarLogger.stats.totalErrors++;
+    } else if (entry->level == DAWN_OF_WAR_LOG_WARN) {
+        g_dawnOfWarLogger.stats.totalWarnings++;
+    }
+    
+    // Update highest queue depth
+    if (g_dawnOfWarLogger.ringBuffer.count > g_dawnOfWarLogger.stats.highestQueueDepth) {
+        g_dawnOfWarLogger.stats.highestQueueDepth = g_dawnOfWarLogger.ringBuffer.count;
+    }
+    LeaveCriticalSection(&g_dawnOfWarLogger.statsCs);
+    
+    // Route to outputs
     if (g_dawnOfWarLogger.config.outputs & DAWN_OF_WAR_OUTPUT_CONSOLE) {
         WriteToConsole(entry);
     }
@@ -504,9 +806,38 @@ static void ProcessLogEntry(const DawnOfWarLogEntry* entry) {
     }
 }
 
+// Save Dawn of War configuration to INI file
+static void SaveConfig(const char* configPath) {
+    // Create default configuration
+    WritePrivateProfileStringA("General", "LogLevel", "INFO", configPath);
+    WritePrivateProfileStringA("General", "Outputs", "Console,File", configPath);
+    
+    WritePrivateProfileStringA("File", "Path", "logs", configPath);
+    WritePrivateProfileStringA("File", "MaxSizeMB", "100", configPath);
+    WritePrivateProfileStringA("File", "RotationCount", "5", configPath);
+    
+    WritePrivateProfileStringA("Network", "Enable", "0", configPath);
+    WritePrivateProfileStringA("Network", "Host", "localhost", configPath);
+    WritePrivateProfileStringA("Network", "Port", "514", configPath);
+    
+    WritePrivateProfileStringA("Performance", "BufferSize", "1024", configPath);
+    WritePrivateProfileStringA("Performance", "EnableColors", "1", configPath);
+    WritePrivateProfileStringA("Performance", "EnableStackTrace", "1", configPath);
+    
+    // Add comments section
+    WritePrivateProfileStringA("Comments", "LogFileFormat", "DawnOfWar_YYYYMMDD_HHMMSS.log", configPath);
+    WritePrivateProfileStringA("Comments", "LogLevels", "TRACE,DEBUG,INFO,WARN,ERROR,FATAL", configPath);
+    WritePrivateProfileStringA("Comments", "Outputs", "Console,File,Memory,Network", configPath);
+}
+
 // Load Dawn of War configuration from INI file
 static void LoadConfig(const char* configPath) {
     char buffer[256];
+    
+    // Create default config file if it doesn't exist
+    if (GetFileAttributesA(configPath) == INVALID_FILE_ATTRIBUTES) {
+        SaveConfig(configPath);
+    }
     
     // General section
     GetPrivateProfileStringA("General", "LogLevel", "INFO", buffer, sizeof(buffer), configPath);
@@ -564,32 +895,44 @@ static DawnOfWarLogLevel GetModuleLevel(const char* module) {
     return g_dawnOfWarLogger.config.globalLevel;
 }
 
-// Rotate Dawn of War log file
+// Rotate Dawn of War log file with enhanced naming
 static void RotateLogFile(void) {
     if (g_dawnOfWarLogger.logFile == INVALID_HANDLE_VALUE) return;
 
     CloseHandle(g_dawnOfWarLogger.logFile);
 
-    // Rename current file
-    char oldName[MAX_PATH];
-    char newName[MAX_PATH];
+    // Get current log file name
+    char currentName[MAX_PATH];
     SYSTEMTIME st;
     GetLocalTime(&st);
-    
-    sprintf_s(oldName, sizeof(oldName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d.log",
+    sprintf_s(currentName, sizeof(currentName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d.log",
         g_dawnOfWarLogger.config.logPath, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     
-    sprintf_s(newName, sizeof(newName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d_old.log",
-        g_dawnOfWarLogger.config.logPath, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    // Create archive directory
+    char archiveDir[MAX_PATH];
+    sprintf_s(archiveDir, sizeof(archiveDir), "%s\\archive", g_dawnOfWarLogger.config.logPath);
+    CreateDirectoryA(archiveDir, NULL);
     
-    MoveFileA(oldName, newName);
+    // Move current file to archive with timestamp
+    char archiveName[MAX_PATH];
+    sprintf_s(archiveName, sizeof(archiveName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d_completed.log",
+        archiveDir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    
+    MoveFileA(currentName, archiveName);
 
     // Create new log file
-    sprintf_s(oldName, sizeof(oldName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d.log",
+    sprintf_s(currentName, sizeof(currentName), "%s\\DawnOfWar_%04d%02d%02d_%02d%02d%02d.log",
         g_dawnOfWarLogger.config.logPath, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     
-    g_dawnOfWarLogger.logFile = CreateFileA(oldName, GENERIC_WRITE, FILE_SHARE_READ,
+    g_dawnOfWarLogger.logFile = CreateFileA(currentName, GENERIC_WRITE, FILE_SHARE_READ,
         NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    
+    if (g_dawnOfWarLogger.logFile != INVALID_HANDLE_VALUE) {
+        const char* rotationMsg = "=== Log Rotated ===\n";
+        DWORD bytesWritten;
+        WriteFile(g_dawnOfWarLogger.logFile, rotationMsg, (DWORD)strlen(rotationMsg), &bytesWritten, NULL);
+        DawnOfWarLog_Write(DAWN_OF_WAR_LOG_INFO, "DawnOfWarLogger", "Log file rotated to: %s", archiveName);
+    }
 }
 
 // Format Dawn of War log message
@@ -751,17 +1094,38 @@ static void SignalHandler(int signal) {
 
 // Initialize Dawn of War console
 static void InitializeConsole(void) {
-    if (AllocConsole()) {
-        freopen_s((FILE**)stdout, "CONOUT$", "w", stdout);
-        freopen_s((FILE**)stderr, "CONOUT$", "w", stderr);
-        freopen_s((FILE**)stdin, "CONIN$", "r", stdin);
-        
-        g_dawnOfWarLogger.consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+    // Try to allocate console, but don't fail if we can't
+    if (!AllocConsole()) {
+        DWORD error = GetLastError();
+        if (error != ERROR_ACCESS_DENIED) { // Console already exists is OK
+            // Try to attach to existing console
+            if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+                // No console available, continue without it
+                g_dawnOfWarLogger.consoleHandle = NULL;
+                return;
+            }
+        }
+    }
+    
+    // Redirect stdout/stderr to console
+    FILE* dummyFile;
+    freopen_s(&dummyFile, "CONOUT$", "w", stdout);
+    freopen_s(&dummyFile, "CONOUT$", "w", stderr);
+    freopen_s(&dummyFile, "CONIN$", "r", stdin);
+    
+    // Get console handle and set title
+    g_dawnOfWarLogger.consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (g_dawnOfWarLogger.consoleHandle && g_dawnOfWarLogger.consoleHandle != INVALID_HANDLE_VALUE) {
         CONSOLE_SCREEN_BUFFER_INFO csbi;
-        GetConsoleScreenBufferInfo(g_dawnOfWarLogger.consoleHandle, &csbi);
-        g_dawnOfWarLogger.defaultConsoleAttributes = csbi.wAttributes;
-        
+        if (GetConsoleScreenBufferInfo(g_dawnOfWarLogger.consoleHandle, &csbi)) {
+            g_dawnOfWarLogger.defaultConsoleAttributes = csbi.wAttributes;
+        }
         SetConsoleTitleA("Dawn of War - Master Logger");
+        
+        // Write initialization message to console
+        DWORD bytesWritten;
+        const char* initMsg = "=== Dawn of War Logger Console Initialized ===\n";
+        WriteConsoleA(g_dawnOfWarLogger.consoleHandle, initMsg, (DWORD)strlen(initMsg), &bytesWritten, NULL);
     }
 }
 
@@ -771,4 +1135,280 @@ static void CleanupConsole(void) {
         FreeConsole();
         g_dawnOfWarLogger.consoleHandle = NULL;
     }
+}
+
+// Enhanced statistics functions
+void DawnOfWarLog_GetDetailedStats(DawnOfWarLoggerStats* stats) {
+    if (!stats || !g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.statsCs);
+    *stats = g_dawnOfWarLogger.stats;
+    LeaveCriticalSection(&g_dawnOfWarLogger.statsCs);
+}
+
+void DawnOfWarLog_GetMemoryStats(DawnOfWarMemoryStats* stats) {
+    if (!stats || !g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    *stats = g_dawnOfWarLogger.memoryStats;
+    LeaveCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+}
+
+void DawnOfWarLog_ResetStats(void) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.statsCs);
+    ZeroMemory(&g_dawnOfWarLogger.stats, sizeof(DawnOfWarLoggerStats));
+    QueryPerformanceCounter(&g_dawnOfWarLogger.stats.startupTime);
+    g_dawnOfWarLogger.stats.totalSessions = 1;
+    LeaveCriticalSection(&g_dawnOfWarLogger.statsCs);
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    ZeroMemory(&g_dawnOfWarLogger.memoryStats, sizeof(DawnOfWarMemoryStats));
+    g_dawnOfWarLogger.memoryStats.smallestAllocation = SIZE_MAX;
+    LeaveCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+}
+
+void DawnOfWarLog_EnableEnhancedConsole(BOOL enable) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    g_dawnOfWarLogger.enhancedConsoleEnabled = enable;
+}
+
+void DawnOfWarLog_UpdateConsoleDisplay(void) {
+    if (!g_dawnOfWarLogger.consoleHandle || !g_dawnOfWarLogger.enhancedConsoleEnabled) return;
+    
+    // Save current cursor position
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    GetConsoleScreenBufferInfo(g_dawnOfWarLogger.consoleHandle, &csbi);
+    COORD originalPos = csbi.dwCursorPosition;
+    
+    // Move to top for status display
+    COORD statusPos = {0, 0};
+    SetConsoleCursorPosition(g_dawnOfWarLogger.consoleHandle, statusPos);
+    
+    // Display status information
+    char statusLine[256];
+    DawnOfWarLoggerStats stats;
+    DawnOfWarLog_GetDetailedStats(&stats);
+    
+    sprintf_s(statusLine, sizeof(statusLine), 
+        "=== DAWN OF WAR LOGGER STATUS ===\n"
+        "Messages: %lu | Bytes: %lu | Rotations: %lu | Peak Queue: %lu\n"
+        "Errors: %lu | Warnings: %lu | Sessions: %lu\n"
+        "================================\n",
+        stats.messagesLogged, stats.bytesWritten, stats.logRotations, stats.highestQueueDepth,
+        stats.totalErrors, stats.totalWarnings, stats.totalSessions);
+    
+    SetConsoleTextAttribute(g_dawnOfWarLogger.consoleHandle, 
+                           FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+    WriteConsoleA(g_dawnOfWarLogger.consoleHandle, statusLine, (DWORD)strlen(statusLine), NULL, NULL);
+    SetConsoleTextAttribute(g_dawnOfWarLogger.consoleHandle, g_dawnOfWarLogger.defaultConsoleAttributes);
+    
+    // Restore cursor position
+    SetConsoleCursorPosition(g_dawnOfWarLogger.consoleHandle, originalPos);
+}
+
+// Memory tracking hooks for integration with memory pool
+void DawnOfWarLog_TrackAllocation(size_t size, void* ptr) {
+    if (!g_dawnOfWarLogger.initialized || !ptr) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    g_dawnOfWarLogger.memoryStats.currentAllocations++;
+    g_dawnOfWarLogger.memoryStats.totalAllocated += size;
+    
+    if (g_dawnOfWarLogger.memoryStats.currentAllocations > g_dawnOfWarLogger.memoryStats.peakAllocations) {
+        g_dawnOfWarLogger.memoryStats.peakAllocations = g_dawnOfWarLogger.memoryStats.currentAllocations;
+    }
+    
+    if (size > g_dawnOfWarLogger.memoryStats.largestAllocation) {
+        g_dawnOfWarLogger.memoryStats.largestAllocation = size;
+    }
+    
+    if (size < g_dawnOfWarLogger.memoryStats.smallestAllocation) {
+        g_dawnOfWarLogger.memoryStats.smallestAllocation = size;
+    }
+    
+    g_dawnOfWarLogger.memoryStats.memoryChecksPerformed++;
+    LeaveCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+}
+
+void DawnOfWarLog_TrackDeallocation(size_t size, void* ptr) {
+    if (!g_dawnOfWarLogger.initialized || !ptr) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    if (g_dawnOfWarLogger.memoryStats.currentAllocations > 0) {
+        g_dawnOfWarLogger.memoryStats.currentAllocations--;
+    }
+    g_dawnOfWarLogger.memoryStats.totalFreed += size;
+    g_dawnOfWarLogger.memoryStats.memoryChecksPerformed++;
+    LeaveCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+}
+
+void DawnOfWarLog_TrackAllocationFailure(size_t size) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    g_dawnOfWarLogger.memoryStats.allocationFailures++;
+    g_dawnOfWarLogger.memoryStats.memoryChecksPerformed++;
+    LeaveCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_ERROR, "MemoryTracker", 
+        "Memory allocation failed for size: %zu bytes", size);
+}
+
+void DawnOfWarLog_TrackFragmentation(size_t wastedBytes) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    g_dawnOfWarLogger.memoryStats.fragmentationEvents++;
+    g_dawnOfWarLogger.memoryStats.memoryChecksPerformed++;
+    LeaveCriticalSection(&g_dawnOfWarLogger.memoryStats.memoryCs);
+    
+    DawnOfWarLog_Write(DAWN_OF_WAR_LOG_WARN, "MemoryTracker", 
+        "Memory fragmentation detected: %zu bytes wasted", wastedBytes);
+}
+
+// LAA State Tracking Functions Implementation
+
+// Function to log LAA state from patcher
+void LogLAAStateFromPatcher(const char* executablePath, bool laaEnabled, 
+                           bool is64BitOS, size_t totalMemory, size_t availableMemory,
+                           size_t addressSpace, DWORD_PTR imageBase) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_logCriticalSection);
+    
+    // Store LAA state
+    g_lastLAAState.isLAAEnabled = laaEnabled;
+    g_lastLAAState.is64BitOS = is64BitOS;
+    g_lastLAAState.totalPhysicalMemory = totalMemory;
+    g_lastLAAState.availablePhysicalMemory = availableMemory;
+    g_lastLAAState.usableAddressSpace = addressSpace;
+    g_lastLAAState.processImageBase = imageBase;
+    g_lastLAAState.timestamp = time(nullptr);
+    strncpy_s(g_lastLAAState.executablePath, sizeof(g_lastLAAState.executablePath), 
+              executablePath, _TRUNCATE);
+    g_laaStateInitialized = true;
+    
+    // Log comprehensive LAA state information
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "=== LAA State from Patcher ===");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Executable: %s", executablePath);
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "LAA Enabled: %s", laaEnabled ? "YES" : "NO");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "64-bit OS: %s", is64BitOS ? "YES" : "NO");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Total Physical Memory: %zu MB", totalMemory / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Available Physical Memory: %zu MB", availableMemory / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Usable Address Space: %zu MB", addressSpace / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Process Image Base: 0x%p", (void*)imageBase);
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Timestamp: %lld", (long long)g_lastLAAState.timestamp);
+    
+    LeaveCriticalSection(&g_logCriticalSection);
+}
+
+// Function to log LAA state from memory DLL
+void LogLAAStateFromMemoryDLL(const char* executablePath, bool laaEnabled,
+                             bool is64BitOS, bool highMemoryAvailable, 
+                             size_t totalMemory, size_t availableMemory,
+                             size_t currentProcessMemory, size_t addressSpace,
+                             DWORD_PTR imageBase, bool canUseLargeAddresses) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_logCriticalSection);
+    
+    // Log memory DLL LAA state
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "=== LAA State from Memory DLL ===");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Executable: %s", executablePath);
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "LAA Enabled: %s", laaEnabled ? "YES" : "NO");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "64-bit OS: %s", is64BitOS ? "YES" : "NO");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "High Memory Available: %s", highMemoryAvailable ? "YES" : "NO");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Can Use Large Addresses: %s", canUseLargeAddresses ? "YES" : "NO");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Total Physical Memory: %zu MB", totalMemory / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Available Physical Memory: %zu MB", availableMemory / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Current Process Memory: %zu MB", currentProcessMemory / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Usable Address Space: %zu MB", addressSpace / (1024 * 1024));
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Process Image Base: 0x%p", (void*)imageBase);
+    
+    // Compare with patcher state if available
+    if (g_laaStateInitialized) {
+        DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "=== LAA State Comparison ===");
+        DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Patcher LAA: %s", g_lastLAAState.isLAAEnabled ? "YES" : "NO");
+        DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Memory DLL LAA: %s", laaEnabled ? "YES" : "NO");
+        
+        bool laaConsistent = (g_lastLAAState.isLAAEnabled == laaEnabled);
+        DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "LAA State Consistent: %s", laaConsistent ? "YES" : "NO");
+        
+        if (!laaConsistent) {
+            DAWN_OF_WAR_LOG_WARN("LAA_TRACKER", "LAA STATE MISMATCH DETECTED!");
+            DAWN_OF_WAR_LOG_WARN("LAA_TRACKER", "Patcher reports: %s", g_lastLAAState.isLAAEnabled ? "ENABLED" : "DISABLED");
+            DAWN_OF_WAR_LOG_WARN("LAA_TRACKER", "Memory DLL reports: %s", laaEnabled ? "ENABLED" : "DISABLED");
+        }
+        
+        // Log memory utilization differences
+        size_t memoryDiff = (totalMemory > g_lastLAAState.totalPhysicalMemory) ? 
+                           (totalMemory - g_lastLAAState.totalPhysicalMemory) :
+                           (g_lastLAAState.totalPhysicalMemory - totalMemory);
+        
+        if (memoryDiff > 0) {
+            DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Memory difference: %zu MB", memoryDiff / (1024 * 1024));
+        }
+    } else {
+        DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "No patcher LAA state available for comparison");
+    }
+    
+    LeaveCriticalSection(&g_logCriticalSection);
+}
+
+// Function to log LAA transition events
+void LogLAATransition(const char* source, const char* executablePath, 
+                     bool fromState, bool toState, const char* reason) {
+    if (!g_dawnOfWarLogger.initialized) return;
+    
+    EnterCriticalSection(&g_logCriticalSection);
+    
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "=== LAA Transition Event ===");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Source: %s", source);
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Executable: %s", executablePath);
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Transition: %s -> %s", 
+                         fromState ? "ENABLED" : "DISABLED", 
+                         toState ? "ENABLED" : "DISABLED");
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Reason: %s", reason);
+    DAWN_OF_WAR_LOG_INFO("LAA_TRACKER", "Timestamp: %lld", (long long)time(nullptr));
+    
+    // Update stored state
+    if (g_laaStateInitialized) {
+        g_lastLAAState.isLAAEnabled = toState;
+        g_lastLAAState.timestamp = time(nullptr);
+    }
+    
+    LeaveCriticalSection(&g_logCriticalSection);
+}
+
+// Function to get current LAA state summary
+void GetLAAStateSummary(char* buffer, size_t bufferSize) {
+    if (!g_dawnOfWarLogger.initialized || !g_laaStateInitialized) {
+        strncpy_s(buffer, bufferSize, "LAA state not initialized", _TRUNCATE);
+        return;
+    }
+    
+    EnterCriticalSection(&g_logCriticalSection);
+    
+    sprintf_s(buffer, bufferSize,
+        "LAA State Summary:\n"
+        "  Executable: %s\n"
+        "  LAA Enabled: %s\n"
+        "  64-bit OS: %s\n"
+        "  Total Memory: %zu MB\n"
+        "  Available Memory: %zu MB\n"
+        "  Address Space: %zu MB\n"
+        "  Image Base: 0x%p\n"
+        "  Last Updated: %lld",
+        g_lastLAAState.executablePath,
+        g_lastLAAState.isLAAEnabled ? "YES" : "NO",
+        g_lastLAAState.is64BitOS ? "YES" : "NO",
+        g_lastLAAState.totalPhysicalMemory / (1024 * 1024),
+        g_lastLAAState.availablePhysicalMemory / (1024 * 1024),
+        g_lastLAAState.usableAddressSpace / (1024 * 1024),
+        (void*)g_lastLAAState.processImageBase,
+        (long long)g_lastLAAState.timestamp);
+    
+    LeaveCriticalSection(&g_logCriticalSection);
 }
